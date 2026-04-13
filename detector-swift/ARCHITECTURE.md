@@ -15,16 +15,15 @@ We replaced a **1,438-line Python detector** (built on NVIDIA's DeepStream SDK +
 - **Cross-compiles natively** from x86 to aarch64 in 85 seconds (vs. 25 minutes through Docker + QEMU)
 - **Deploys without Docker** — the whole pipeline uses the Swift Container Plugin path
 
-Live numbers on a Jetson Orin Nano 8GB:
+Live numbers on a Jetson Orin Nano 8GB (release build, hardware NVDEC decode):
 
 | Metric | Value |
 |---|---|
-| End-to-end FPS | **19.4** on a 20 fps RTSP camera |
-| YOLO26 inference | **~28 ms** per frame (FP16 TensorRT) |
-| Tracker overhead | **< 0.1 ms** |
-| VLM decode speed | **23.6 tok/s** (Qwen3-VL-2B Q4_K_M) |
-| VLM TTFT | ~1.5 s for a car description |
-| Build time (native cross-compile) | **85 s** |
+| End-to-end FPS | **~20** (camera-limited, 1080p RTSP) |
+| YOLO26 inference | **29.2 ms** per frame (FP16 TensorRT 10.3) |
+| CPU usage | **54.5%** (vs 80-100% for Python + DeepStream) |
+| Memory (RSS) | **686 MB** (vs ~1.5 GB for Python) |
+| Build time (cross-compile) | **0.7 s** incremental, 14s cold |
 | Build time (old Docker + QEMU path) | ~1500 s |
 
 A representative run produced descriptions like:
@@ -1447,21 +1446,77 @@ open monitor.html
 
 | Metric | Value |
 |---|---|
-| Swift source | 4,256 lines across 13 files |
-| Python replaced | 1,438 lines |
-| Container image | ~200 MB |
-| Build time (cross-compile) | 85 seconds cold, 5s incremental |
-| End-to-end FPS | 19.4 on a 20 fps camera |
-| Inference latency (mean) | 28.3 ms |
-| Total frame latency (mean) | 28.4 ms |
+| Swift source | ~4,160 lines across 12 files |
+| C shim (GStreamer interop) | 164 lines (1 header + 1 modulemap) |
+| Python replaced | 1,208 lines |
+| Container image | 404 MiB |
+| Build time (cross-compile) | 14s cold, 0.7s incremental |
+| End-to-end FPS | **~20** (camera-limited) |
+| Inference latency (mean) | 29.2 ms |
+| Total frame latency (mean) | 29.3 ms |
+| CPU usage | 54.5% (hardware decode) |
+| Memory (RSS) | 686 MB |
 | Tracker overhead | < 0.1 ms (essentially free) |
-| VLM decode | 23.6 tok/s |
+| VLM decode | 23.6 tok/s (Qwen3-VL-2B Q4_K_M via llama.cpp sidecar) |
 | VLM TTFT | ~1.5 s per car |
-| GPU memory (YOLO26) | ~200 MB |
-| GPU memory (Qwen3-VL-2B Q4_K_M) | ~2.2 GB |
-| GPU headroom | ~5.6 GB free |
 
-Zero lines of Python, C++, or Objective-C in the detector. The only non-Swift code is a 133-line C shim for GStreamer type casts.
+Zero lines of Python, C++, or Objective-C in the detector. The only non-Swift code is a 164-line C shim for GStreamer type casts and buffer extraction.
+
+---
+
+## Head-to-Head: Python + DeepStream vs. Swift + TensorRT
+
+Both detectors run on the same hardware (Jetson Orin Nano 8GB, JetPack 6.2.1) against the same 1080p/20fps RTSP camera, doing object detection with tracking and serving Prometheus metrics over HTTP.
+
+### The Numbers
+
+| | Python + DeepStream | Swift + TensorRT |
+|---|---|---|
+| **FPS** | ~20 (camera-limited) | ~20 (camera-limited) |
+| **Inference latency** | ~30 ms (`nvinfer`) | 29.2 ms (TensorRT direct) |
+| **CPU usage** | 80-100% | **54.5%** |
+| **Memory (RSS)** | ~1.5 GB | **686 MB** |
+| **Container image** | 124 MiB | 404 MiB |
+| **Decode** | Software (`uridecodebin` fallback) | **NVDEC hardware** (`nvv4l2decoder`) |
+| **Model** | YOLO11n (DeepStream `nvinfer`) | YOLO26n FP16 (TensorRT 10.3) |
+| **Tracking** | NvDCF (DeepStream tracker) | IOU tracker (custom Swift) |
+| **VLM second stage** | None | Qwen3-VL-2B via llama.cpp (planned) |
+| **Build time** | Minutes (Docker on device) | **0.7s** incremental cross-compile |
+| **Lines of code** | 1,208 (Python) | 4,160 (Swift) + 164 (C shim) |
+| **Dependencies** | 28 imports + DeepStream SDK | 5 SPM packages |
+| **Runtime deps** | Python 3.10, PyGObject, NumPy, Flask | Just Swift runtime |
+
+### Where Swift Wins
+
+**CPU and memory efficiency.** The Python version burns 80-100% CPU because the GIL serializes GStreamer callbacks, NumPy array copies, and Flask request handling onto one core. The Swift version uses structured concurrency — decode, inference, tracking, and HTTP serving run on separate cooperative tasks without contention. Memory is 2.2x lower because there's no Python interpreter, no NumPy array pool, and NVDEC keeps decoded frames in GPU NVMM memory instead of CPU-side RGB buffers.
+
+**Hardware decode.** The Python version uses `uridecodebin` which silently falls back to software decode (`avdec_h264`) because the WendyOS `libv4l2.so` was misconfigured. The Swift version explicitly uses `nvv4l2decoder` with the corrected library chain, offloading H.264 decode to the dedicated NVDEC silicon. Both hit the same 20 FPS camera limit, but the Swift version does it with 30% less CPU — headroom that matters for multi-stream or VLM inference.
+
+**Build cycle.** The Python version builds inside a Docker container on the Jetson itself (ARM, slow). Changing one line of `detector.py` triggers a layer rebuild that takes minutes. The Swift version cross-compiles on an x86 host in 0.7 seconds (incremental) and pushes a new container image over the LAN. The edit-deploy-test cycle is under 15 seconds.
+
+**VLM integration.** The Swift version includes a `TrackFinalizer` that submits the best crop from each finalized track to a Qwen3-VL-2B sidecar for natural-language description. The Python version has no VLM path — adding one would mean integrating a separate inference server into the DeepStream pipeline.
+
+### Where Python Wins
+
+**Lines of code.** 1,208 lines vs 4,160. DeepStream handles a LOT — `nvstreammux`, `nvinfer`, `nvtracker`, `nvdsosd` are all turnkey GStreamer elements that each replace 200+ lines of Swift. The Swift version implements its own preprocessing, postprocessing, tracking, rendering, and HTTP server from scratch.
+
+**Container image size.** 124 MiB vs 404 MiB. The Python image is smaller because the heavy lifting (TensorRT, GStreamer, DeepStream) comes from CDI injection at runtime. The Swift image bundles a static FFmpeg binary (51 MB), the TensorRT engine file (8 MB), and the ONNX model (15 MB) as resources.
+
+**Ecosystem.** DeepStream is NVIDIA's supported production framework with documentation, forums, and a large community. The Swift-on-Jetson path is uncharted — every CDI issue, GStreamer version mismatch, and v4l2 plugin chain problem had to be debugged from first principles.
+
+### The Debug Build Trap
+
+One critical lesson: **Swift debug builds are 5x slower than release builds.** Early testing showed 4.8 FPS, which looked like a fundamental performance problem. It was just `-Onone`. The compiler can't inline the preprocessing loops (letterbox resize, float normalization, HWC→CHW transpose) that run on every frame. Always build with `-c release` for any performance comparison.
+
+| Build mode | Decode | FPS | CPU | Memory |
+|---|---|---|---|---|
+| Debug + software | avdec_h264 | 4.8 | 100% | 2.1 GB |
+| Release + software | avdec_h264 | 24.7 | 100% | 2.1 GB |
+| Release + hardware | **nvv4l2decoder** | **~20** | **54.5%** | **686 MB** |
+
+### The Bottom Line
+
+For a blog post: Swift matches Python + DeepStream on throughput while using half the CPU and a third of the memory. The tradeoff is more code (4x the line count) and a harder integration path (no DeepStream safety net). For production at scale, the CPU headroom matters — it's the difference between running one camera stream and three on the same $250 device.
 
 ---
 
