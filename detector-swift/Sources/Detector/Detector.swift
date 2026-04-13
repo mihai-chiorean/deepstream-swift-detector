@@ -1,11 +1,12 @@
 // Detector.swift
-// Main entry point for the Swift YOLO11n object detector.
+// Main entry point for the Swift YOLO26n object detector with VLM integration.
 //
 // Ties together:
-//   - TensorRT engine loading (DetectorEngine)
+//   - TensorRT engine loading (DetectorEngine) — YOLO26 NMS-free detection
 //   - RTSP frame decoding (RTSPFrameReader via FFmpeg subprocess)
-//   - YOLO preprocessing, inference, postprocessing, NMS
+//   - YOLO preprocessing and inference (no NMS — YOLO26 is end-to-end)
 //   - IoU-based multi-object tracking (IOUTracker)
+//   - VLM descriptions via llama.cpp sidecar (VLMClient)
 //   - Bounding box rendering and JPEG encoding (FrameRenderer)
 //   - Hummingbird HTTP server on :9090 (metrics, MJPEG, health)
 //   - Prometheus metrics (Metrics.swift)
@@ -13,24 +14,68 @@
 import ArgumentParser
 import Logging
 
+#if canImport(Glibc)
+    import Glibc
+#elseif canImport(Musl)
+    import Musl
+#endif
+
 #if canImport(FoundationEssentials)
     internal import FoundationEssentials
 #else
     internal import Foundation
 #endif
 
+// Redirect stdout/stderr to a log file very early in startup.
+//
+// WendyOS runs the container with stdout/stderr wired to a containerd named
+// pipe that nothing reads, so `print(...)` and swift-log messages go into the
+// void. Writing to a real file lets us debug the detection pipeline via
+// `ssh root@<device> "cat /app/detector.log"`.
+//
+// Called from main() before any logger is constructed so nothing is lost.
+@inline(__always)
+private func redirectStdioToFile(_ path: String) {
+    let fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
+    guard fd >= 0 else { return }
+    // Write a startup marker so each process invocation is visibly delimited.
+    let marker = "\n=== Detector starting (pid \(getpid())) ===\n"
+    _ = marker.withCString { cstr in
+        write(fd, cstr, strlen(cstr))
+    }
+    _ = dup2(fd, 1)   // stdout
+    _ = dup2(fd, 2)   // stderr
+    // Note: we don't call setvbuf(stdout, ...) here because Swift 6 flags
+    // the global `stdout` as non-Sendable. Writes to fd 1/2 via the raw
+    // syscall path (which swift-log's StreamLogHandler uses internally)
+    // are already line-buffered by the kernel on character device fds.
+    close(fd)
+}
+
 @main
 struct Detector: AsyncParsableCommand {
 
     static let configuration = CommandConfiguration(
-        abstract: "YOLO11n object detector — Swift/TensorRT edition"
+        abstract: "YOLO26n object detector with VLM — Swift/TensorRT edition"
     )
 
+    // Engine path resolution order:
+    //   1. The image-bundled engine at /app/yolo26n_b2_fp16.engine (pre-built,
+    //      shipped in the container image via wendy.json `resources`). Fastest
+    //      first-boot — no ONNX→engine rebuild needed.
+    //   2. The persist-volume cache at /var/cache/detector/yolo26n_b2_fp16.engine
+    //      (used when the image-bundled path is missing; useful during development
+    //      when the engine is being rebuilt).
+    //   3. If neither exists, DetectorEngine falls back to ONNX and writes the
+    //      result to the persist-volume cache for next time.
     @Option(name: .long, help: "Path to serialised TensorRT engine file")
-    var enginePath: String = "/app/model_b2_gpu0_fp16.engine"
+    var enginePath: String = "/app/yolo26n_b2_fp16.engine"
+
+    @Option(name: .long, help: "Fallback cache path used if the engine must be rebuilt from ONNX")
+    var engineCachePath: String = "/var/cache/detector/yolo26n_b2_fp16.engine"
 
     @Option(name: .long, help: "Path to ONNX model (fallback if engine missing)")
-    var onnxPath: String = "/app/yolo11n.onnx"
+    var onnxPath: String = "/app/yolo26n.onnx"
 
     @Option(name: .long, help: "Path to labels.txt (one class name per line)")
     var labelsPath: String = "/app/labels.txt"
@@ -41,7 +86,18 @@ struct Detector: AsyncParsableCommand {
     @Option(name: .long, help: "HTTP server port")
     var port: Int = 9090
 
+    @Option(name: .long, help: "VLM server URL (llama.cpp sidecar)")
+    var vlmURL: String = "http://127.0.0.1:8090"
+
     func run() async throws {
+        // Redirect stdio BEFORE touching any logger. WendyOS containerd wires
+        // stdout/stderr to an unread named pipe; everything printed there is
+        // lost. The log file lives in the `detector-cache` persistence volume
+        // at /var/cache/detector/detector.log so it survives container restarts.
+        // Readable via:
+        //   ssh root@<device> "cat /var/lib/wendy-agent/storage/detector-cache/detector.log"
+        redirectStdioToFile("/var/cache/detector/detector.log")
+
         var logger = Logger(label: "detector")
         logger.logLevel = .info
 
@@ -68,6 +124,7 @@ struct Detector: AsyncParsableCommand {
         logger.info("Loading TensorRT engine...")
         let engine = try await DetectorEngine(
             enginePath: enginePath,
+            engineCachePath: engineCachePath,
             onnxPath: onnxPath,
             labelsPath: labelsPath
         )
@@ -80,7 +137,24 @@ struct Detector: AsyncParsableCommand {
         let detectorState = DetectorState()
 
         // ---------------------------------------------------------------
-        // 4. Start the HTTP server in the background
+        // 4. VLM client for track descriptions
+        // ---------------------------------------------------------------
+
+        let vlmClient = VLMClient(baseURL: vlmURL)
+        let trackFinalizer = TrackFinalizer(vlmClient: vlmClient)
+
+        // Check VLM availability in the background.
+        Task {
+            let available = await vlmClient.checkHealth()
+            if available {
+                logger.info("VLM server available at \(vlmURL)")
+            } else {
+                logger.warning("VLM server not available at \(vlmURL) — descriptions disabled")
+            }
+        }
+
+        // ---------------------------------------------------------------
+        // 5. Start the HTTP server in the background
         // ---------------------------------------------------------------
 
         let httpTask = Task {
@@ -88,6 +162,7 @@ struct Detector: AsyncParsableCommand {
                 try await startHTTPServer(
                     state: detectorState,
                     metrics: metrics,
+                    vlmClient: vlmClient,
                     port: port
                 )
             } catch {
@@ -98,7 +173,7 @@ struct Detector: AsyncParsableCommand {
         logger.info("HTTP server starting on port \(port)")
 
         // ---------------------------------------------------------------
-        // 5. Run one detection loop per enabled stream
+        // 6. Run one detection loop per enabled stream
         // ---------------------------------------------------------------
 
         let taskLogger = logger
@@ -110,6 +185,7 @@ struct Detector: AsyncParsableCommand {
                         stream: stream,
                         engine: engine,
                         state: detectorState,
+                        trackFinalizer: trackFinalizer,
                         logger: taskLogger
                     )
                 }
@@ -134,6 +210,7 @@ private func runStreamDetectionLoop(
     stream: StreamConfig,
     engine: DetectorEngine,
     state: DetectorState,
+    trackFinalizer: TrackFinalizer,
     logger: Logger
 ) async {
     var logger = logger
@@ -141,6 +218,7 @@ private func runStreamDetectionLoop(
 
     // Pre-create metric handles for this stream.
     let fps = fpsGauge(stream: stream.name)
+    let activeTracks = activeTracksGauge(stream: stream.name)
     let framesProcessed = framesProcessedCounter(stream: stream.name)
     let inferenceLatency = inferenceLatencyHistogram(stream: stream.name)
     let totalLatency = totalLatencyHistogram(stream: stream.name)
@@ -155,8 +233,14 @@ private func runStreamDetectionLoop(
     var frameCount: UInt64 = 0
     var fpsWindowStart = ContinuousClock.now
 
-    // Frame reader (spawns ffmpeg).
-    let reader = FrameReader(stream: stream)
+    // Cache the label list (immutable after init, avoids per-frame actor hop).
+    let classLabels = engine.postprocessor.labels
+
+    // Frame reader: GStreamer in-process with avdec_h264 software decode.
+    // Hardware decode (nvv4l2decoder) is broken at the WendyOS platform level:
+    // libnvv4l2.so's v4l2_fd_open fails to claim /dev/v4l2-nvdec even on the
+    // host (outside containers). Needs platform fix in meta-tegra/meta-wendyos.
+    let reader = GStreamerReader(stream: stream)
 
     logger.info("Starting detection loop")
 
@@ -172,6 +256,16 @@ private func runStreamDetectionLoop(
 
             // --- Tracking ---
             detections = tracker.update(detections: detections)
+            activeTracks.set(Double(tracker.confirmedTrackCount))
+
+            // --- VLM: submit finalized tracks for description ---
+            for finalized in tracker.finalizedTracks {
+                await trackFinalizer.submit(
+                    track: finalized,
+                    frame: frame,
+                    labels: classLabels
+                )
+            }
 
             // --- Metrics ---
             frameCount += 1

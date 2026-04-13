@@ -370,6 +370,13 @@ struct Track: Sendable {
     /// Most recent detection confidence score.
     var confidence: Float
 
+    /// Best (highest) confidence score seen during the track's lifetime.
+    /// Used to select the best frame for VLM description.
+    var bestConfidence: Float
+
+    /// Bounding box at the frame with the highest confidence.
+    var bestBBox: BBox
+
     /// Total number of frames this track has existed (including missed frames).
     var age: Int
 
@@ -397,10 +404,34 @@ struct Track: Sendable {
 ///   - `checkClassMatch: 1`         (only associate tracks and detections of
 ///                                   the same class)
 ///   - `stateEstimatorType: 1`      (constant-velocity Kalman filter)
+/// A track that was confirmed and then removed (lost for too long).
+/// Carries the metadata needed for VLM description.
+struct FinalizedTrack: Sendable {
+    /// The track's unique ID.
+    let id: Int
+    /// The COCO class index of the tracked object.
+    let classId: Int
+    /// The best (highest) confidence score seen during the track's lifetime.
+    let bestConfidence: Float
+    /// Total number of frames where the track received a detection.
+    let totalHits: Int
+    /// Bounding box from the frame with the highest confidence (model-space pixels).
+    let bestBBox: BBox
+}
+
 struct IOUTracker: Sendable {
     var tracks: [Track] = []
     var nextTrackId: Int = 1
     let config: TrackerConfig
+
+    /// Tracks that were pruned this frame (confirmed tracks that exceeded
+    /// maxShadowTrackingAge). Consumed by the VLM pipeline after each update.
+    private(set) var finalizedTracks: [FinalizedTrack] = []
+
+    /// Number of tracks that have been confirmed (past probation).
+    var confirmedTrackCount: Int {
+        tracks.count { $0.state == .confirmed }
+    }
 
     init(config: TrackerConfig = TrackerConfig()) {
         self.config = config
@@ -425,6 +456,9 @@ struct IOUTracker: Sendable {
     /// - Returns: Same detections with `trackId` set for matched / new tracks.
     mutating func update(detections: [Detection]) -> [Detection] {
 
+        // Clear previous frame's finalized tracks.
+        finalizedTracks.removeAll(keepingCapacity: true)
+
         // Step 1: Predict every existing track one frame forward.
         for i in tracks.indices {
             tracks[i].kalmanFilter.predict()
@@ -448,6 +482,12 @@ struct IOUTracker: Sendable {
             tracks[trackIdx].confidence = det.confidence
             tracks[trackIdx].hitCount  += 1
             tracks[trackIdx].missCount  = 0
+
+            // Track the best-confidence frame for VLM crop selection.
+            if det.confidence > tracks[trackIdx].bestConfidence {
+                tracks[trackIdx].bestConfidence = det.confidence
+                tracks[trackIdx].bestBBox = detBBox
+            }
 
             switch tracks[trackIdx].state {
             case .tentative:
@@ -477,6 +517,8 @@ struct IOUTracker: Sendable {
                 kalmanFilter: KalmanFilter2D(measurement: bbox),
                 classId: det.classId,
                 confidence: det.confidence,
+                bestConfidence: det.confidence,
+                bestBBox: bbox,
                 age: 1,
                 hitCount: 1,
                 missCount: 0,
@@ -495,15 +537,25 @@ struct IOUTracker: Sendable {
             }
         }
 
-        // Step 7: Prune dead tracks.
+        // Step 7: Prune dead tracks. Emit confirmed tracks as finalized
+        // so the VLM pipeline can describe them.
         tracks.removeAll { track in
             switch track.state {
             case .tentative:
-                // Kill unconfirmed tracks quickly (earlyTerminationAge misses).
                 return track.missCount > config.earlyTerminationAge
             case .confirmed, .lost:
-                // Confirmed / lost tracks get the full shadow-tracking window.
-                return track.missCount > config.maxShadowTrackingAge
+                let shouldRemove = track.missCount > config.maxShadowTrackingAge
+                if shouldRemove && track.hitCount >= config.probationAge {
+                    // This was a real, confirmed track — emit it for VLM processing.
+                    finalizedTracks.append(FinalizedTrack(
+                        id: track.id,
+                        classId: track.classId,
+                        bestConfidence: track.bestConfidence,
+                        totalHits: track.hitCount,
+                        bestBBox: track.bestBBox
+                    ))
+                }
+                return shouldRemove
             }
         }
 
