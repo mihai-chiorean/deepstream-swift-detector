@@ -2,8 +2,19 @@
     "appId": "sh.wendy.examples.deepstream-detector-swift",
     "version": "1.0.0",
     "language": "swift",
+    "swift": {
+        "baseImage": "192.168.68.70:5000/swift-detector-base:latest",
+        "resources": [
+            "streams.json:/app/streams.json",
+            "labels.txt:/app/labels.txt",
+            "yolo26n.onnx:/app/yolo26n.onnx",
+            "yolo26n_b2_fp16.engine:/app/yolo26n_b2_fp16.engine",
+            "ffmpeg:/app/ffmpeg"
+        ]
+    },
     "entitlements": [
         {"type": "gpu"},
-        {"type": "network", "mode": "host"}
+        {"type": "network", "mode": "host"},
+        {"type": "persist", "name": "detector-cache", "path": "/var/cache/detector"}
     ]
 }

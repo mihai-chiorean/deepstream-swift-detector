@@ -1,11 +1,14 @@
 // DetectorEngine.swift
-// High-level YOLO11n detection interface backed by a TensorRT engine.
+// High-level YOLO26n detection interface backed by a TensorRT engine.
 //
-// Engine configuration (mirrors the Python detector):
-//   - Pre-built engine: model_b2_gpu0_fp16.engine  (FP16, batch size 2)
-//   - ONNX fallback:    yolo11n.onnx
+// Engine configuration:
+//   - Pre-built engine: yolo26n_b2_fp16.engine  (FP16, batch size 2)
+//   - ONNX fallback:    yolo26n.onnx
 //   - Input shape:      [batch, 3, 640, 640]  Float32
-//   - Output shape:     [batch, 84, 8400]     Float32  (YOLO11 transposed)
+//   - Output shape:     [batch, 300, 6]       Float32  (YOLO26 NMS-free)
+//
+// YOLO26 output format: 300 detection slots, each [x1, y1, x2, y2, conf, class_id].
+// No NMS or anchor decoding required — the model outputs final detections.
 //
 // The actor serialises all engine state access so that concurrent callers
 // cannot corrupt the TensorRT execution context. CPU-heavy work (preprocessing,
@@ -69,7 +72,7 @@ actor DetectorEngine {
 
     // MARK: Private properties
 
-    private let logger: Logger
+    private let logger: Logging.Logger
 
     /// Maximum batch size the engine was built for.
     private let maxBatchSize: Int
@@ -89,25 +92,46 @@ actor DetectorEngine {
     ///
     /// - Throws: `DetectorError` when neither source produces a valid engine, or
     ///   when engine introspection/warmup fails.
-    init(enginePath: String?, onnxPath: String?, labelsPath: String) async throws {
+    init(
+        enginePath: String?,
+        engineCachePath: String? = nil,
+        onnxPath: String?,
+        labelsPath: String
+    ) async throws {
         self.logger = Logger(label: "DetectorEngine")
         self.modelSize = 640
         self.preprocessor = YOLOPreprocessor()
 
         // ------------------------------------------------------------------
         // 1. Load or build the TensorRT engine
+        //
+        // Resolution order:
+        //   a) `enginePath`      — pre-built engine shipped in the image
+        //   b) `engineCachePath` — engine saved to the persist volume after a
+        //                         previous ONNX rebuild on this specific device
+        //   c) `onnxPath`        — rebuild from ONNX (5-8 min on Orin Nano),
+        //                         then write the result to engineCachePath for
+        //                         next time.
         // ------------------------------------------------------------------
 
         let runtime = TensorRTRuntime()
         let loadedEngine: Engine
 
-        if let ep = enginePath, FileManager.default.fileExists(atPath: ep) {
+        // Pick the first existing pre-built engine file from (enginePath, engineCachePath).
+        let resolvedEnginePath: String? = {
+            if let ep = enginePath, FileManager.default.fileExists(atPath: ep) { return ep }
+            if let cp = engineCachePath, FileManager.default.fileExists(atPath: cp) { return cp }
+            return nil
+        }()
+
+        if let ep = resolvedEnginePath {
             // Preferred path: deserialise a pre-built plan (fast startup).
             logger.info("Loading pre-built TensorRT engine", metadata: [
                 "path": "\(ep)",
             ])
             do {
-                loadedEngine = try runtime.deserializeEngine(from: ep)
+                let engineData = try Data(contentsOf: URL(fileURLWithPath: ep))
+                loadedEngine = try runtime.deserializeEngine(from: engineData)
             } catch {
                 throw DetectorError.engineLoadFailed(
                     "Failed to deserialise engine at \(ep): \(error)"
@@ -125,10 +149,39 @@ actor DetectorEngine {
             //       here follow the documented API surface.
             let options = EngineBuildOptions(precision: [.fp16])
             do {
-                loadedEngine = try await runtime.buildEngine(onnxURL: onnxURL, options: options)
+                loadedEngine = try runtime.buildEngine(onnxURL: onnxURL, options: options)
             } catch {
                 throw DetectorError.engineLoadFailed(
                     "Failed to build engine from ONNX at \(op): \(error)"
+                )
+            }
+            // Persist the built engine so subsequent starts skip the ~8-minute
+            // ONNX-to-TensorRT conversion. Prefer the persist-volume cache
+            // path (writable) over enginePath (which may point into /app
+            // that's mounted read-only from the image).
+            let saveURL: URL
+            if let cp = engineCachePath {
+                saveURL = URL(fileURLWithPath: cp)
+                // Ensure the parent directory exists.
+                let parent = saveURL.deletingLastPathComponent()
+                try? FileManager.default.createDirectory(
+                    at: parent, withIntermediateDirectories: true
+                )
+            } else if let ep = enginePath {
+                saveURL = URL(fileURLWithPath: ep)
+            } else {
+                saveURL = URL(fileURLWithPath: op).deletingPathExtension()
+                    .appendingPathExtension("engine")
+            }
+            do {
+                try loadedEngine.save(to: saveURL)
+                logger.info("TensorRT engine saved", metadata: ["path": "\(saveURL.path)"])
+            } catch {
+                // Non-fatal: the engine works in memory even if saving fails
+                // (e.g. read-only filesystem).
+                logger.warning(
+                    "Could not save engine to disk (will rebuild next start)",
+                    metadata: ["path": "\(saveURL.path)", "error": "\(error)"]
                 )
             }
         } else {
@@ -193,42 +246,20 @@ actor DetectorEngine {
             YOLOPreprocessor.preprocess(ptr, width: frame.width, height: frame.height)
         }
 
-        // Output layout: [1, 84, 8400] for a single-image batch.
-        let numRows    = 84       // 4 bbox + 80 classes
-        let numAnchors = 8400
-        let outputCount = numRows * numAnchors
+        // YOLO26 output layout: [1, 300, 6] — 300 detection slots, each
+        // containing [x1, y1, x2, y2, confidence, class_id].
+        let outputCount = YOLOPostprocessor.maxDetections * YOLOPostprocessor.valuesPerDetection
         var outputBuffer = [Float](repeating: 0.0, count: outputCount)
 
         // Run inference on the GPU via the execution context.
-        //
-        // TODO: Verify the exact enqueueF32 / enqueue signature for the
-        //       installed tensorrt-swift version. The expected call pattern is:
-        //
-        //   try context.enqueueF32(
-        //       inputName:  "images",
-        //       input:      inputPtr,
-        //       outputName: "output0",
-        //       output:     outputPtr
-        //   )
-        //
-        // If the library requires TensorDescriptor / TensorValue wrappers,
-        // construct them here and pass them instead of raw buffer pointers.
-        let inferenceSucceeded = try inputData.withUnsafeBufferPointer { inputPtr in
-            try outputBuffer.withUnsafeMutableBufferPointer { outputPtr in
-                try context.enqueueF32(
-                    inputName:  "images",
-                    input:      inputPtr,
-                    outputName: "output0",
-                    output:     outputPtr
-                )
-            }
-        }
+        try await context.enqueueF32(
+            inputName:  "images",
+            input:      inputData,
+            outputName: "output0",
+            output:     &outputBuffer
+        )
 
-        if !inferenceSucceeded {
-            throw DetectorError.inferenceFailed("enqueueF32 returned false for single frame")
-        }
-
-        // Postprocess: decode anchors and apply per-class NMS.
+        // YOLO26: no anchor decode or NMS — just confidence filter.
         var detections = outputBuffer.withUnsafeBufferPointer { ptr in
             postprocessor.process(output: ptr, batchSize: 1)
         }
@@ -296,32 +327,16 @@ actor DetectorEngine {
         // 2. Single batched inference call.
         // ------------------------------------------------------------------
 
-        // Output layout: [batchSize, 84, 8400].
-        let numRows          = 84
-        let numAnchors       = 8400
-        let elementsPerImage = numRows * numAnchors
+        // YOLO26 output layout: [batchSize, 300, 6].
+        let elementsPerImage = YOLOPostprocessor.maxDetections * YOLOPostprocessor.valuesPerDetection
         var batchOutput      = [Float](repeating: 0.0, count: batchSize * elementsPerImage)
 
-        // TODO: Verify that context.enqueueF32 accepts a batched input when the
-        //       engine was built with batchSize > 1. Some tensorrt-swift
-        //       versions require a setInputShape() call before enqueue to set
-        //       the dynamic batch dimension at runtime.
-        let inferenceSucceeded = try batchInput.withUnsafeBufferPointer { inputPtr in
-            try batchOutput.withUnsafeMutableBufferPointer { outputPtr in
-                try context.enqueueF32(
-                    inputName:  "images",
-                    input:      inputPtr,
-                    outputName: "output0",
-                    output:     outputPtr
-                )
-            }
-        }
-
-        if !inferenceSucceeded {
-            throw DetectorError.inferenceFailed(
-                "enqueueF32 returned false for batch of \(batchSize)"
-            )
-        }
+        try await context.enqueueF32(
+            inputName:  "images",
+            input:      batchInput,
+            outputName: "output0",
+            output:     &batchOutput
+        )
 
         // ------------------------------------------------------------------
         // 3. Split output tensor and postprocess per frame.
@@ -331,7 +346,6 @@ actor DetectorEngine {
         results.reserveCapacity(batchSize)
 
         for i in 0 ..< batchSize {
-            // Slice the flat output buffer to this frame's contiguous region.
             let offset      = i * elementsPerImage
             var detections  = batchOutput.withUnsafeBufferPointer { fullBuf -> [Detection] in
                 let slice = UnsafeBufferPointer(
@@ -341,7 +355,6 @@ actor DetectorEngine {
                 return postprocessor.process(output: slice, batchSize: 1)
             }
 
-            // Remap from 640x640 model space back to original image coordinates.
             YOLOPreprocessor.remapBoxes(&detections, letterbox: letterboxes[i])
             results.append(detections)
         }

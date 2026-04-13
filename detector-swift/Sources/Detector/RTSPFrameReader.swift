@@ -157,7 +157,11 @@ actor RTSPFrameReader {
         let pipe = Pipe()
 
         let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/ffmpeg")
+        // Static ffmpeg binary bundled as a wendy.json resource at /app/ffmpeg.
+        // Falls back to /usr/bin/ffmpeg if present in the container image.
+        let ffmpegPath = ["/app/ffmpeg", "/usr/bin/ffmpeg"]
+            .first { FileManager.default.fileExists(atPath: $0) } ?? "/usr/bin/ffmpeg"
+        proc.executableURL = URL(fileURLWithPath: ffmpegPath)
         proc.arguments = ffmpegArguments()
         proc.standardOutput = pipe
         // Suppress stderr from polluting our stdout; the process writes warnings there.
@@ -216,28 +220,49 @@ actor RTSPFrameReader {
         )
     }
 
+    /// Whether the stream URL points to a local file rather than an RTSP source.
+    private var isFileSource: Bool {
+        let url = stream.url
+        return url.hasPrefix("/") || url.hasPrefix("file://")
+    }
+
     /// Build the argument list for the ffmpeg subprocess.
     ///
-    /// Settings mirror the Python detector:
-    /// - TCP transport for reliability
-    /// - 500 ms latency buffer via `-analyzeduration` / `-probesize`
-    /// - 10-second connection timeout
+    /// For RTSP sources: TCP transport, 500 ms latency buffer, 10-second timeout.
+    /// For file sources: loop infinitely at realtime speed (conference demo fallback).
     private func ffmpegArguments() -> [String] {
-        [
-            "-hide_banner",
-            "-loglevel", "warning",
-            // Connection & buffering options must appear before -i
-            "-rtsp_transport", "tcp",
-            "-analyzeduration", "500000",   // 500 ms in microseconds
-            "-probesize", "500000",         // 500 KB probe size
-            "-timeout", "10000000",         // 10 s connection timeout in microseconds
+        var args: [String] = ["-hide_banner", "-loglevel", "warning"]
+
+        if isFileSource {
+            // Loop the file forever and pace output at realtime speed.
+            args += ["-stream_loop", "-1", "-re"]
+        } else {
+            // RTSP-specific connection & buffering options (must appear before -i).
+            // RTSP-specific connection & buffering options (must appear before -i).
+            // Note: `-stimeout` was removed in ffmpeg 7.x. In 7.x, `-timeout`
+            // is the socket timeout option (no longer "listen mode" as in 6.x).
+            args += [
+                "-rtsp_transport", "tcp",
+                "-analyzeduration", "500000",   // 500 ms in microseconds
+                "-probesize", "500000",         // 500 KB probe size
+                "-timeout", "10000000",         // 10 s socket timeout in microseconds
+            ]
+            // NOTE: Hardware decode (e.g. -hwaccel cuda) requires an FFmpeg
+            // build with NVDEC support, which Ubuntu 22.04's ffmpeg package
+            // does not include. For now we use software decode — a future
+            // optimisation is to swap to a hardware-accelerated decoder via
+            // GStreamer (nvv4l2decoder) for ~30% CPU savings per stream.
+        }
+
+        args += [
             "-i", stream.url,
-            // Output options
             "-vf", "scale=\(width):\(height)",
             "-pix_fmt", "rgb24",
             "-f", "rawvideo",
             "pipe:1",
         ]
+
+        return args
     }
 }
 

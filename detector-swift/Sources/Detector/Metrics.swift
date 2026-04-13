@@ -378,6 +378,15 @@ func fpsGauge(stream: String) -> GaugeMetric {
     )
 }
 
+/// Number of confirmed active tracks, per stream.
+func activeTracksGauge(stream: String) -> GaugeMetric {
+    metrics.gauge(
+        "deepstream_active_tracks",
+        help: "Number of confirmed active tracks",
+        labels: ["stream": stream]
+    )
+}
+
 /// GPU memory usage in megabytes (no stream label).
 let gpuMemoryMB: GaugeMetric = metrics.gauge(
     "deepstream_gpu_memory_mb",
