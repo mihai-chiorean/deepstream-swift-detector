@@ -90,17 +90,10 @@ actor GStreamerFrameReader {
     func start() throws {
         guard !isRunning else { return }
 
-        // NVDEC environment setup:
-        // 1. LIBV4L2_PLUGIN_DIR: tells libv4l2 where to find the NV userspace plugin
-        //    that intercepts /dev/v4l2-nvdec and routes ioctls to NVDEC hardware.
-        // 2. LD_PRELOAD libnvv4l2.so: NVIDIA's patched libv4l2 must load BEFORE the
-        //    container's stock libv4l2 — it wraps v4l2_open/ioctl to support the
-        //    plugin claim mechanism. Without this, the stock libv4l2 doesn't know
-        //    about plugins and hits ENOTTY on /dev/v4l2-nvdec (which is /dev/null).
-        setenv("LIBV4L2_PLUGIN_DIR",
-               "/usr/share/nvidia-container-passthrough/usr/lib/aarch64-linux-gnu/libv4l/plugins/nv", 1)
-        setenv("LD_PRELOAD",
-               "/usr/share/nvidia-container-passthrough/usr/lib/aarch64-linux-gnu/nvidia/libnvv4l2.so", 1)
+        // Note: LIBV4L2_PLUGIN_DIR is NOT used by libnvv4l2.so (NVIDIA's version
+        // hardcodes the path to /usr/lib/aarch64-linux-gnu/libv4l/plugins/nv/*.so).
+        // The plugins must be symlinked there on the host and CDI-mounted into
+        // the container at that same path.
 
         // Plugin discovery: CDI injects GStreamer 1.22 plugins from the host
         // at /usr/lib/gstreamer-1.0/ and NV-specific plugins at the passthrough
@@ -244,16 +237,18 @@ actor GStreamerFrameReader {
 
     private func buildPipelineString() -> String {
         let url = stream.url
-        // Pipeline: rtspsrc + avdec_h264 (software decode).
-        // All elements CDI-injected from WendyOS host (GStreamer 1.22).
-        // nvv4l2decoder is broken at the WendyOS platform level (v4l2_fd_open
-        // fails to claim /dev/v4l2-nvdec). avdec_h264 ~4.8 FPS on Orin Nano.
+        // Pipeline: rtspsrc + nvv4l2decoder (NVIDIA NVDEC hardware H.264 decode).
+        // Requires: libnvv4l2.so as system libv4l2.so.0 + plugin symlinks at
+        // /usr/lib/aarch64-linux-gnu/libv4l/plugins/nv/ (hardcoded path in libnvv4l2).
+        // nvvideoconvert compute-hw=1 uses GPU for colorspace conversion
+        // (VIC doesn't support NVMM→RGB, only GPU does).
+        // nvvideoconvert outputs to system RAM (no memory:NVMM) so appsink
+        // can read the RGB buffer directly.
         return """
         rtspsrc location=\(url) latency=200 protocols=tcp ! \
         rtph264depay ! h264parse ! \
-        avdec_h264 ! \
-        videoconvert ! \
-        videoscale ! \
+        nvv4l2decoder ! \
+        nvvideoconvert compute-hw=1 ! \
         video/x-raw,format=RGB,width=\(width),height=\(height) ! \
         appsink name=wendy_sink emit-signals=false sync=false max-buffers=2 drop=true
         """
