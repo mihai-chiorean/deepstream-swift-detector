@@ -484,10 +484,18 @@
     </div>
 
     <script>
+        // When served through monitor_proxy.py on edge-builder-1, all requests
+        // are same-origin under /detector/* and /gpu/*. The device-input box is
+        // kept for backwards compatibility if someone opens this file directly.
         let deviceHost = '';
+        const useProxy = window.location.protocol !== 'file:';
 
-        function getDetectorUrl(path) { return `http://${deviceHost}:9090${path}`; }
-        function getGpuUrl(path) { return `http://${deviceHost}:9091${path}`; }
+        function getDetectorUrl(path) {
+            return useProxy ? `/detector${path}` : `http://${deviceHost}:9090${path}`;
+        }
+        function getGpuUrl(path) {
+            return useProxy ? `/gpu${path}` : `http://${deviceHost}:9091${path}`;
+        }
 
         function updateDevice() {
             const input = document.getElementById('device-input');
@@ -512,6 +520,12 @@
             if (saved) {
                 document.getElementById('device-input').value = saved;
                 deviceHost = saved;
+            }
+            if (useProxy) {
+                log('Served via proxy — using same-origin /detector and /gpu', 'info');
+                document.getElementById('video-stream').src = getDetectorUrl('/stream');
+                refreshAll();
+            } else if (saved) {
                 log(`Restored device: ${saved}`, 'info');
                 document.getElementById('video-stream').src = getDetectorUrl('/stream');
                 refreshAll();
@@ -531,7 +545,7 @@
         }
 
         async function checkService(url, name) {
-            if (!deviceHost) return null;
+            if (!useProxy && !deviceHost) return null;
             try {
                 log(`Checking ${name}...`, 'info');
                 const response = await fetch(url);
