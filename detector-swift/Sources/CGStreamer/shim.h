@@ -37,6 +37,15 @@ static inline gint wendy_gst_registry_scan_path(const gchar *path) {
     return gst_registry_scan_path(registry, path);
 }
 
+// Returns 1 if the element factory named `name` exists in the GStreamer registry,
+// 0 otherwise. Use this at startup to probe optional elements and pick a fallback.
+static inline int wendy_gst_element_exists(const gchar *name) {
+    GstElementFactory *factory = gst_element_factory_find(name);
+    if (!factory) return 0;
+    gst_object_unref(factory);
+    return 1;
+}
+
 // Pull a sample, extract its raw byte buffer, and return it through out-params.
 //
 // On success returns 1 and fills `out_data`, `out_size`. The caller must call
@@ -86,6 +95,58 @@ static inline int wendy_gst_pull_sample(
     return 1;
 }
 
+// Timed variant: waits at most `timeout_ns` nanoseconds for a sample.
+//
+// Returns:
+//   1  — sample available; fills out_sample / out_data / out_size.
+//   0  — EOS or pipeline in NULL/READY state.
+//  -1  — timeout expired without a sample (caller should retry or check bus).
+//
+// Caller must release with wendy_gst_release_sample on return value 1.
+static inline int wendy_gst_try_pull_sample(
+    GstAppSink *sink,
+    GstClockTime timeout_ns,
+    void **out_sample,
+    void **out_data,
+    size_t *out_size
+) {
+    *out_sample = NULL;
+    *out_data = NULL;
+    *out_size = 0;
+
+    GstSample *sample = gst_app_sink_try_pull_sample(sink, timeout_ns);
+    if (!sample) {
+        // EOS returns NULL here too; distinguish via eos flag.
+        if (gst_app_sink_is_eos(sink)) return 0;
+        return -1;  // timeout
+    }
+
+    GstBuffer *buffer = gst_sample_get_buffer(sample);
+    if (!buffer) {
+        gst_sample_unref(sample);
+        return 0;
+    }
+
+    typedef struct {
+        GstSample *sample;
+        GstMapInfo map;
+    } SampleHandle;
+
+    SampleHandle *handle = (SampleHandle *)g_malloc(sizeof(SampleHandle));
+    handle->sample = sample;
+
+    if (!gst_buffer_map(buffer, &handle->map, GST_MAP_READ)) {
+        gst_sample_unref(sample);
+        g_free(handle);
+        return 0;
+    }
+
+    *out_sample = handle;
+    *out_data = handle->map.data;
+    *out_size = handle->map.size;
+    return 1;
+}
+
 // Release a sample handle returned by wendy_gst_pull_sample.
 static inline void wendy_gst_release_sample(void *sample_handle) {
     if (!sample_handle) return;
@@ -99,6 +160,49 @@ static inline void wendy_gst_release_sample(void *sample_handle) {
     gst_buffer_unmap(buffer, &handle->map);
     gst_sample_unref(handle->sample);
     g_free(handle);
+}
+
+// Check the GStreamer bus for an error or EOS message (non-blocking).
+//
+// Returns:
+//   0  — no pending error/EOS message.
+//   1  — error message found; fills out_message (caller must g_free it).
+//   2  — EOS message found; out_message is NULL.
+//
+// out_message is a g_strdup'd copy of "domain: message". Caller must g_free.
+static inline int wendy_gst_bus_pop_error(
+    GstElement *pipeline,
+    char **out_message
+) {
+    *out_message = NULL;
+    GstBus *bus = gst_element_get_bus(pipeline);
+    if (!bus) return 0;
+
+    GstMessage *msg = gst_bus_pop_filtered(
+        bus,
+        GST_MESSAGE_ERROR | GST_MESSAGE_EOS
+    );
+    gst_object_unref(bus);
+    if (!msg) return 0;
+
+    if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_EOS) {
+        gst_message_unref(msg);
+        return 2;
+    }
+
+    // Error message.
+    GError *err = NULL;
+    gchar *dbg = NULL;
+    gst_message_parse_error(msg, &err, &dbg);
+    gst_message_unref(msg);
+
+    if (err) {
+        gchar *combined = g_strdup_printf("%s: %s", err->message, dbg ? dbg : "");
+        g_error_free(err);
+        g_free(dbg);
+        *out_message = combined;
+    }
+    return 1;
 }
 
 // Get the negotiated caps width/height from a sample.
