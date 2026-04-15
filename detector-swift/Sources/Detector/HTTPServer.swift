@@ -1,12 +1,18 @@
 // HTTPServer.swift
-// HTTP server for the Swift detector, matching the Flask server from detector.py.
+// HTTP server for the Swift DeepStream detector.
 //
 // Exposes:
 //   GET /metrics               - Prometheus text format metrics
 //   GET /health                - JSON health status
-//   GET /stream                - MJPEG video stream (multipart/x-mixed-replace)
-//   GET /api/vlm_descriptions  - Recent VLM descriptions (placeholder)
-//   GET /api/vlm_status        - VLM service status (placeholder)
+//   GET /stream                - MJPEG multipart/x-mixed-replace live video
+//   GET /api/vlm_descriptions  - Recent VLM descriptions
+//   GET /api/vlm_status        - VLM service status
+//
+// /stream: served by MJPEGSidecar. The sidecar pipeline (rtspsrc →
+// nvv4l2decoder → nvvideoconvert → videorate → nvjpegenc → appsink) starts
+// on the first client connection and stops when the last disconnects.
+// gst_buffer_map is called only on system-memory JPEG buffers output by
+// nvjpegenc — no NVMM pinning, no leak.
 //
 // Port: 9090 (matching Python detector default)
 
@@ -23,91 +29,33 @@ import NIOCore
 // MARK: - DetectorState
 
 /// Shared mutable state that the HTTP server reads from the detection pipeline.
-///
-/// The actor serialises all access to `latestJPEGFrame` and
-/// `mjpegClientCount`. New frames are broadcast to every waiting MJPEG handler
-/// through per-client `AsyncStream` continuations so each connected client
-/// wakes up independently and at its own pace.
 actor DetectorState: Sendable {
 
-    // MARK: Stored state
+    // MARK: MJPEG sidecar
 
-    /// The most recently produced JPEG-encoded frame (bboxes already rendered).
+    private(set) var mjpegSidecar: MJPEGSidecar?
+
+    func setMJPEGSidecar(_ sidecar: MJPEGSidecar) {
+        self.mjpegSidecar = sidecar
+    }
+
+    // MARK: Legacy frame store (retained for forward compatibility)
+
     private(set) var latestJPEGFrame: [UInt8]?
-
-    /// Number of browsers / players currently consuming the MJPEG stream.
     private(set) var mjpegClientCount: Int = 0
 
-    // MARK: Frame notification
+    var shouldExtractFrames: Bool { mjpegClientCount > 0 }
 
-    /// Active continuations keyed by client UUID - one entry per connected MJPEG
-    /// client. Each continuation receives a copy of the JPEG bytes whenever a
-    /// new frame is stored.
-    private var frameContinuations: [UUID: AsyncStream<[UInt8]>.Continuation] = [:]
-
-    // MARK: Public interface
-
-    /// Returns true while at least one MJPEG client is connected.
-    ///
-    /// The detection pipeline can read this to decide whether it is worth
-    /// spending CPU time JPEG-encoding frames.
-    var shouldExtractFrames: Bool {
-        mjpegClientCount > 0
-    }
-
-    /// Stores a new JPEG frame and wakes every waiting MJPEG client.
     func setFrame(_ jpeg: [UInt8]) {
         latestJPEGFrame = jpeg
-        for continuation in frameContinuations.values {
-            continuation.yield(jpeg)
-        }
     }
 
-    /// Returns the latest stored frame, or nil if none has arrived yet.
-    func getFrame() -> [UInt8]? {
-        latestJPEGFrame
-    }
-
-    // MARK: MJPEG client lifecycle
-
-    /// Registers a new MJPEG client and returns a stream of JPEG frames.
-    ///
-    /// - Returns: A tuple of a unique token (used to unregister later) and an
-    ///   `AsyncStream` that yields JPEG-encoded bytes whenever `setFrame` is
-    ///   called.
-    func connectMJPEGClient() -> (id: UUID, frames: AsyncStream<[UInt8]>) {
-        mjpegClientCount += 1
-        let id = UUID()
-        let (stream, continuation) = AsyncStream<[UInt8]>.makeStream()
-        frameContinuations[id] = continuation
-        return (id, stream)
-    }
-
-    /// Unregisters an MJPEG client and finishes its frame stream.
-    func disconnectMJPEGClient(id: UUID) {
-        guard mjpegClientCount > 0 else { return }
-        mjpegClientCount -= 1
-        frameContinuations[id]?.finish()
-        frameContinuations.removeValue(forKey: id)
-    }
+    func getFrame() -> [UInt8]? { latestJPEGFrame }
 }
 
 // MARK: - AllOriginsMiddleware
 
-/// Adds CORS headers to every response regardless of whether an `Origin`
-/// request header is present.
-///
-/// This matches the Python detector's `add_cors_headers` after_request hook
-/// which unconditionally sets:
-///   Access-Control-Allow-Origin: *
-///   Access-Control-Allow-Methods: GET, POST, OPTIONS
-///   Access-Control-Allow-Headers: Content-Type
-///
-/// Named `AllOriginsMiddleware` rather than `CORSMiddleware` to avoid a name
-/// collision with Hummingbird's built-in `CORSMiddleware` (which only fires
-/// when an `Origin` request header is present).
 struct AllOriginsMiddleware<Context: RequestContext>: RouterMiddleware {
-
     func handle(
         _ request: Request,
         context: Context,
@@ -123,13 +71,6 @@ struct AllOriginsMiddleware<Context: RequestContext>: RouterMiddleware {
 
 // MARK: - Router builder
 
-/// Builds the Hummingbird router with all detector HTTP routes.
-///
-/// - Parameters:
-///   - state:   The shared actor that holds the current frame and client count.
-///   - metrics: The registry whose `render()` output is served at /metrics.
-/// - Returns: A configured `Router<BasicRequestContext>` ready to be passed
-///   to `Application`.
 func buildRouter(
     state: DetectorState,
     metrics: MetricsRegistry,
@@ -137,8 +78,6 @@ func buildRouter(
 ) -> Router<BasicRequestContext> {
 
     let router = Router(context: BasicRequestContext.self)
-
-    // Apply CORS headers unconditionally to all responses.
     router.middlewares.add(AllOriginsMiddleware())
 
     // ------------------------------------------------------------------
@@ -157,8 +96,6 @@ func buildRouter(
 
     // ------------------------------------------------------------------
     // GET /health  - JSON health check
-    //
-    // Matches Python: {'status': 'healthy', 'timestamp': datetime.utcnow().isoformat()}
     // ------------------------------------------------------------------
     router.get("health") { _, _ -> Response in
         let timestamp = Date().ISO8601Format()
@@ -173,83 +110,71 @@ func buildRouter(
     }
 
     // ------------------------------------------------------------------
-    // GET /stream  - MJPEG multipart stream
+    // GET /stream  - MJPEG multipart/x-mixed-replace video stream
     //
-    // Registers the caller as an MJPEG client, then streams JPEG frames
-    // as they arrive from the detection pipeline. The `shouldExtractFrames`
-    // flag tells the pipeline whether it is worth spending CPU time encoding
-    // frames.
+    // Each HTTP request opens a persistent streaming connection. The
+    // MJPEGSidecar pipeline starts on the first connection and stops
+    // when the last client disconnects.
     //
-    // Frames and 1-second keepalive ticks are merged into a single
-    // AsyncStream<[UInt8]?> so the writer loop is a plain `for await`
-    // without touching any non-Sendable iterators from multiple tasks.
+    // Frame format (RFC 2046 multipart):
+    //   --mjpegframe\r\n
+    //   Content-Type: image/jpeg\r\n
+    //   Content-Length: <N>\r\n
+    //   \r\n
+    //   <JPEG bytes>
+    //   \r\n
     // ------------------------------------------------------------------
     router.get("stream") { _, _ -> Response in
-        let (clientID, frameStream) = await state.connectMJPEGClient()
+        guard let sidecar = await state.mjpegSidecar else {
+            let json = "{\"error\":\"MJPEG sidecar not initialised\",\"status\":503}"
+            var headers = HTTPFields()
+            headers[.contentType] = "application/json"
+            return Response(
+                status: .serviceUnavailable,
+                headers: headers,
+                body: ResponseBody(byteBuffer: ByteBuffer(string: json))
+            )
+        }
+
+        let (clientID, frameStream) = await sidecar.subscribeFrames()
 
         var headers = HTTPFields()
-        headers[.contentType] = "multipart/x-mixed-replace; boundary=frame"
+        headers[.contentType] = "multipart/x-mixed-replace; boundary=mjpegframe"
         headers[.cacheControl] = "no-cache, no-store, must-revalidate"
 
-        // Build a streaming ResponseBody. All background tasks are created
-        // inside the body closure using withTaskGroup for structured
-        // concurrency — they are automatically cancelled when the closure
-        // exits (client disconnect / server shutdown).
-        let body = ResponseBody { [state] writer in
-            do {
-                // Send the most-recent frame immediately so the browser
-                // displays something without waiting for the next detection.
-                if let existing = await state.getFrame() {
-                    try await writer.write(mjpegPart(jpeg: existing))
+        let body = ResponseBody { writer in
+            // Stream JPEG frames until the client disconnects or the sidecar ends.
+            // When writing throws (client disconnected), we break out, unsubscribe,
+            // and call finish so Hummingbird closes the connection cleanly.
+            var writeError: (any Error)?
+            for await jpeg in frameStream {
+                var part = ByteBuffer()
+                part.writeString("--mjpegframe\r\n")
+                part.writeString("Content-Type: image/jpeg\r\n")
+                part.writeString("Content-Length: \(jpeg.count)\r\n")
+                part.writeString("\r\n")
+                part.writeBytes(jpeg)
+                part.writeString("\r\n")
+                do {
+                    try await writer.write(part)
+                } catch {
+                    // Client disconnected — normal, not an error to propagate.
+                    writeError = error
+                    break
                 }
-
-                // Merge frame stream + keepalive clock into a single
-                // AsyncStream so the writer loop is a plain `for await`.
-                let (mergedStream, mergedContinuation) = AsyncStream<[UInt8]?>.makeStream(
-                    bufferingPolicy: .bufferingNewest(3)
-                )
-
-                try await withThrowingTaskGroup(of: Void.self) { group in
-                    // Frame forwarder
-                    group.addTask {
-                        for await jpeg in frameStream {
-                            mergedContinuation.yield(jpeg)
-                        }
-                        mergedContinuation.finish()
-                    }
-
-                    // Keepalive clock
-                    group.addTask {
-                        while !Task.isCancelled {
-                            try? await Task.sleep(for: .seconds(1))
-                            mergedContinuation.yield(nil)
-                        }
-                    }
-
-                    // Writer loop runs in the parent task (writer is inout
-                    // and cannot be captured by a child task).
-                    for await element in mergedStream {
-                        if Task.isCancelled { break }
-                        if let jpeg = element {
-                            try await writer.write(mjpegPart(jpeg: jpeg))
-                        } else {
-                            var buf = ByteBuffer()
-                            buf.writeString("--frame\r\n\r\n")
-                            try await writer.write(buf)
-                        }
-                    }
-
-                    // Writer finished (stream closed or client disconnected).
-                    // Cancel the forwarder + ticker.
-                    group.cancelAll()
-                }
-            } catch {
-                // Write error (client disconnected) — fall through to cleanup.
             }
 
-            // Directly await the actor disconnect — no fire-and-forget Task.
-            await state.disconnectMJPEGClient(id: clientID)
-            try await writer.finish(nil)
+            // Unsubscribe regardless of how the loop exited.
+            await sidecar.unsubscribe(id: clientID)
+
+            // Close the response body. If the client already disconnected,
+            // this will throw — that's fine, Hummingbird handles it.
+            if writeError == nil {
+                try await writer.finish(nil)
+            } else {
+                // Swallow the finish error — client is gone.
+                try? await writer.finish(nil)
+            }
         }
 
         return Response(status: .ok, headers: headers, body: body)
@@ -257,10 +182,6 @@ func buildRouter(
 
     // ------------------------------------------------------------------
     // GET /api/vlm_descriptions  - Recent VLM descriptions
-    //
-    // Returns the most recent VLM-generated descriptions of tracked objects.
-    // Each entry includes the track ID, class label, description text,
-    // and timestamp.
     // ------------------------------------------------------------------
     router.get("api/vlm_descriptions") { _, _ -> Response in
         let descriptions = await vlmClient.getRecentDescriptions()
@@ -282,8 +203,6 @@ func buildRouter(
 
     // ------------------------------------------------------------------
     // GET /api/vlm_status  - VLM service availability
-    //
-    // Returns the current availability of the llama.cpp VLM sidecar.
     // ------------------------------------------------------------------
     router.get("api/vlm_status") { _, _ -> Response in
         let available = await vlmClient.available
@@ -307,41 +226,8 @@ private struct VLMDescriptionsResponse: Encodable {
     let descriptions: [VLMDescription]
 }
 
-// MARK: - MJPEG frame helper
-
-/// Builds a single MJPEG multipart body part from raw JPEG bytes.
-///
-/// Wire format (matching Python detector.py generate() yield):
-///
-///     --frame\r\n
-///     Content-Type: image/jpeg\r\n
-///     Content-Length: <N>\r\n
-///     \r\n
-///     <JPEG bytes>
-///     \r\n
-private func mjpegPart(jpeg: [UInt8]) -> ByteBuffer {
-    var buf = ByteBuffer()
-    buf.writeString("--frame\r\n")
-    buf.writeString("Content-Type: image/jpeg\r\n")
-    buf.writeString("Content-Length: \(jpeg.count)\r\n")
-    buf.writeString("\r\n")
-    buf.writeBytes(jpeg)
-    buf.writeString("\r\n")
-    return buf
-}
-
 // MARK: - Server entry point
 
-/// Creates and runs the Hummingbird HTTP server on `0.0.0.0:port`.
-///
-/// This function suspends until the server exits (e.g. on SIGTERM).
-/// When using `ServiceGroup` for graceful shutdown, pass the returned
-/// `Application` as a service rather than calling this function directly.
-///
-/// - Parameters:
-///   - state:   Shared actor the MJPEG stream endpoint reads frames from.
-///   - metrics: Registry whose text is served at GET /metrics.
-///   - port:    TCP port to bind. Defaults to 9090 to match the Python detector.
 func startHTTPServer(
     state: DetectorState,
     metrics: MetricsRegistry,
