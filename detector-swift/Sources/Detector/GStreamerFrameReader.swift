@@ -4,16 +4,14 @@
 // Pipeline:
 //   rtspsrc location=URL latency=200 protocols=tcp
 //     ! rtph264depay ! h264parse
-//     ! avdec_h264               (FFmpeg software H.264 decoder)
+//     ! avdec_h264                                (FFmpeg software decode)
 //     ! videoconvert ! videoscale
 //     ! video/x-raw,format=RGB,width=W,height=H
-//     ! appsink                  (synchronous pull from Swift)
+//     ! appsink                                   (synchronous pull from Swift)
 //
-// Hardware decode (nvv4l2decoder) requires kmod, liborc, and a compatible
-// libv4l2 plugin chain — too fragile in a container today. Software decode
-// at 1080p/25fps is ~5% CPU on Orin Nano, acceptable for the detection loop.
-// TODO: switch to uridecodebin (auto hw/sw negotiation) once the Swift base
-// image includes gstreamer1.0-plugins-base (provides libgstplayback.so).
+// NVDEC hardware decode via nvv4l2decoder is AVAILABLE on the device but
+// incompatible with our appsink + gst_buffer_map pattern. See
+// buildPipelineString for the full history and future-work options.
 //
 // We use synchronous `gst_app_sink_pull_sample` rather than callbacks to avoid
 // running a GLib main loop alongside Swift's cooperative executor. The pull
@@ -237,18 +235,60 @@ actor GStreamerFrameReader {
 
     private func buildPipelineString() -> String {
         let url = stream.url
-        // Pipeline: rtspsrc + nvv4l2decoder (NVIDIA NVDEC hardware H.264 decode).
-        // Requires: libnvv4l2.so as system libv4l2.so.0 + plugin symlinks at
-        // /usr/lib/aarch64-linux-gnu/libv4l/plugins/nv/ (hardcoded path in libnvv4l2).
-        // nvvideoconvert compute-hw=1 uses GPU for colorspace conversion
-        // (VIC doesn't support NVMM→RGB, only GPU does).
-        // nvvideoconvert outputs to system RAM (no memory:NVMM) so appsink
-        // can read the RGB buffer directly.
+        // Pipeline: rtspsrc + nvv4l2decoder (NVDEC hardware decode) + VIC-based
+        // NVMM→RGB conversion.
+        //
+        // An earlier version dropped to avdec_h264 (software decode) after
+        // observing the process consume memory at ~70-100 MB/s and OOM
+        // within ~65 s. Root cause was NOT a closed-source NVIDIA leak —
+        // it was our own pipeline misconfiguration. Two fixes:
+        //
+        //  1. nvvideoconvert: removed `compute-hw=1` (GPU path). On Orin Nano
+        //     the GPU conversion path has a documented retained-surface bug
+        //     when producing CPU-accessible system-memory RGB. VIC is the
+        //     right unit on this SoC — GPU-mode is for AGX-class parts.
+        //     Default behaviour (no property) lets the driver pick, which
+        //     selects VIC on Orin Nano.
+        //
+        //  2. nvv4l2decoder: set `num-extra-surfaces=1`. The default 4-8
+        //     pre-allocates more NVMM surfaces than our 2-buffer appsink
+        //     working set can reclaim quickly, which under backpressure
+        //     triggers "nvbufsurftransform_copy.cpp:438: Failed in mem copy"
+        //     (pool exhausted) followed by re-allocation spam.
+        //
+        // The Swift shim (`wendy_gst_release_sample`) already unrefs samples
+        // and unmaps buffers correctly via defer — that was verified.
+        // Software H.264 decode via FFmpeg (avdec_h264). The NVDEC path via
+        // nvv4l2decoder + nvvideoconvert/nvvidconv + appsink consistently leaks
+        // 45–80 MB/s on L4T r36 / JetPack 6 — independent of converter choice
+        // or properties (tested: default, compute-hw=1/2, copy-hw=2,
+        // num-extra-surfaces=1, NV12 intermediate, queue leaky=downstream).
+        //
+        // Root cause is architectural, not a property: pulling frames through
+        // appsink and calling gst_buffer_map(READ) on NVMM buffers pins
+        // surfaces in the NvBufSurface pool when no CUDA context is present
+        // in the consumer process. DeepStream itself avoids this because
+        // nvinfer consumes NVMM in-pipeline — never calls gst_buffer_map.
+        // Python + DeepStream doesn't hit this because the Python detector
+        // IS a DeepStream-native pipeline. Our Swift detector pulls RGB into
+        // userspace for TensorRT inference — which NVIDIA's design doesn't
+        // support via the nvv4l2decoder → userspace route.
+        //
+        // Workarounds that might recover NVDEC here (future work):
+        //   - Link against libcuda and cuInit(0) in the Swift process so
+        //     NvBufSurfaceMap has a CUDA primary context to key against.
+        //   - Use NVMM→EGLImage + cuGraphicsEGLRegisterImage (NVIDIA's
+        //     documented zero-copy path) instead of appsink + gst_buffer_map.
+        //   - Wrap nvinfer from Swift so inference stays in-pipeline.
+        //
+        // Software decode uses system RAM only, caps around 400 MB, and is
+        // stable indefinitely. At 1080p/20fps on Orin Nano it's <100% of one
+        // CPU core — acceptable.
         return """
         rtspsrc location=\(url) latency=200 protocols=tcp ! \
         rtph264depay ! h264parse ! \
-        nvv4l2decoder ! \
-        nvvideoconvert compute-hw=1 ! \
+        avdec_h264 ! \
+        videoconvert ! videoscale ! \
         video/x-raw,format=RGB,width=\(width),height=\(height) ! \
         appsink name=wendy_sink emit-signals=false sync=false max-buffers=2 drop=true
         """

@@ -226,6 +226,18 @@ private func runStreamDetectionLoop(
     // Tracker state (mutated per frame).
     var tracker = IOUTracker()
 
+    // Preallocated scratch buffer for MJPEG rendering.
+    // Reused every rendered frame to avoid a ~6 MB heap allocation at 20 FPS
+    // (124 MB/s allocation pressure exhausted swap on Jetson Orin Nano within
+    // ~65 s when a stream client was connected).
+    var renderScratch = [UInt8]()
+
+    // Render throttle: cap MJPEG output at 8 FPS (125 ms minimum interval).
+    // Full inference still runs at the source frame rate; we only skip the
+    // expensive copy + JPEG-encode step when the budget hasn't elapsed.
+    var lastRenderTime = ContinuousClock.now
+    let renderInterval = Duration.milliseconds(125)   // 8 FPS cap
+
     // Cache for per-class counter handles (avoids Mutex lock per class per frame).
     var classCounterCache: [String: CounterMetric] = [:]
 
@@ -299,14 +311,28 @@ private func runStreamDetectionLoop(
             }
 
             // --- Frame rendering (only if MJPEG clients connected) ---
+            //
+            // The rendering path is throttled to 8 FPS to bound memory pressure:
+            //   -  is a preallocated buffer reused each frame,
+            //     eliminating the per-frame 6.2 MB heap allocation that caused
+            //     continuous swap churn at 20 FPS (observed: 88 MB/s swap growth,
+            //     OOM in ~65 s on an 8 GB Orin Nano with a 5 GiB cgroup cap).
+            //   - The 125 ms gate skips encoding on frames where the MJPEG client
+            //     wouldn't benefit (sub-8 FPS MJPEG is visually acceptable for a
+            //     surveillance preview; the inference pipeline runs unthrottled).
             if await state.shouldExtractFrames {
-                if let jpeg = FrameRenderer.renderFrame(
-                    frame.data,
-                    width: frame.width,
-                    height: frame.height,
-                    detections: detections
-                ) {
-                    await state.setFrame(jpeg)
+                let now = ContinuousClock.now
+                if now - lastRenderTime >= renderInterval {
+                    lastRenderTime = now
+                    if let jpeg = FrameRenderer.renderFrame(
+                        frame.data,
+                        into: &renderScratch,
+                        width: frame.width,
+                        height: frame.height,
+                        detections: detections
+                    ) {
+                        await state.setFrame(jpeg)
+                    }
                 }
             }
 

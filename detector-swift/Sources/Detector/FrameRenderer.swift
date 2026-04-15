@@ -43,6 +43,46 @@ struct FrameRenderer: Sendable {
         return JPEGEncoder.encode(rgb: mutable, width: width, height: height)
     }
 
+    /// Scratch-buffer variant: copies `frame` into the caller-provided
+    /// `scratch` buffer (resizing only when dimensions change), draws
+    /// detections in-place, and JPEG-encodes the result.
+    ///
+    /// By reusing a single pre-allocated buffer across frames the caller
+    /// avoids a 6+ MB heap allocation per frame at 20 FPS, which was
+    /// causing continuous swap pressure and eventual OOM on constrained
+    /// devices (Jetson Orin Nano, 8 GB unified memory).
+    ///
+    /// - Parameters:
+    ///   - frame:   Source RGB pixel data (width × height × 3 bytes).
+    ///   - scratch: Caller-owned reusable buffer; resized lazily.
+    ///   - width:   Frame width in pixels.
+    ///   - height:  Frame height in pixels.
+    ///   - detections: Detections in source-image pixel space.
+    /// - Returns: JPEG-encoded bytes, or `nil` when encoding fails.
+    static func renderFrame(
+        _ frame: [UInt8],
+        into scratch: inout [UInt8],
+        width: Int,
+        height: Int,
+        detections: [Detection]
+    ) -> [UInt8]? {
+        let expectedSize = width * height * 3
+        // Resize the scratch buffer only when the frame geometry changes.
+        if scratch.count != expectedSize {
+            scratch = [UInt8](repeating: 0, count: expectedSize)
+        }
+        // Bulk-copy the source frame bytes into scratch, then draw on top.
+        // withUnsafeMutableBytes / withUnsafeBytes use RawBufferPointer
+        // which supports copyMemory natively — no baseAddress nil-check needed.
+        scratch.withUnsafeMutableBytes { dst in
+            frame.withUnsafeBytes { src in
+                dst.copyMemory(from: src)
+            }
+        }
+        drawDetections(on: &scratch, width: width, height: height, detections: detections)
+        return JPEGEncoder.encode(rgb: scratch, width: width, height: height)
+    }
+
     // MARK: Bounding box drawing
 
     /// Draw green bounding boxes and label overlays for every detection.
