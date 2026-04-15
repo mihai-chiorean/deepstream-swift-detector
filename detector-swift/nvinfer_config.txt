@@ -1,0 +1,50 @@
+[property]
+gpu-id=0
+
+# YOLO26 (Ultralytics) end-to-end detector.
+# Output tensor: [1, 300, 6] — 300 detection slots, each [x1, y1, x2, y2, confidence, class_id].
+# NMS-free: the one-to-one head makes clustering / NMS unnecessary.
+
+# Preprocessing: divide by 255.
+net-scale-factor=0.0039215697906911373
+
+# Engine was built outside DeepStream. nvinfer will load the pre-built plan as-is.
+model-engine-file=/app/yolo26n_b2_fp16.engine
+labelfile-path=/app/labels.txt
+
+# Match the engine build.
+batch-size=2
+infer-dims=3;640;640
+model-color-format=0          ; RGB (YOLO26 was exported expecting RGB input)
+
+# FP16.
+network-mode=2
+
+num-detected-classes=80
+gie-unique-id=1
+process-mode=1                ; primary (full-frame inference)
+network-type=0                ; object detector
+
+# YOLO26 is NMS-free end-to-end: output is already final detections.
+# cluster-mode=4 = "no clustering" — emit raw detections as returned by the parser.
+cluster-mode=4
+
+# Letterbox with centered padding to match how the engine was trained.
+maintain-aspect-ratio=1
+symmetric-padding=1
+
+# Every frame (interval=0 means no skip).
+interval=0
+
+# Custom output parser — reads our [1, 300, 6] tensor.
+# See Sources/CNvdsParser/nvdsparsebbox_yolo26.cpp
+custom-lib-path=/app/lib/libnvdsparsebbox_yolo26.so
+parse-bbox-func-name=NvDsInferParseYolo26
+
+# Pre-built engine only; nvinfer should not attempt to rebuild.
+force-implicit-batch-dim=0
+
+[class-attrs-all]
+pre-cluster-threshold=0.4
+# post-cluster kept at default since cluster-mode=4 is no-op; our parser does the confidence filter.
+topk=300
