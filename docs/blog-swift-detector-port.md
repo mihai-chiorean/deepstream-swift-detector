@@ -104,7 +104,9 @@ for (NvDsMetaList *fl = bm->frame_meta_list; fl && count < maxOut; fl = fl->next
 
 That's the whole boundary. Swift code touches zero NVMM. Detection data crosses as a flat C struct. The pad probe runs on the GStreamer streaming thread and yields into an `AsyncStream<DetectionFrame>` that the rest of the app consumes like any other Swift async sequence.
 
-Same FPS as before — 20 on the same 1080p RTSP source. The leak canary on `/sys/kernel/debug/nvmap/iovmm/allocations` is flat after warmup, where the old version had it climbing 65 MB → 3.1 GB in 30 seconds. RSS plateaus well under the 5 GiB cgroup cap and stays there across multi-hour soak runs, vs. the old behavior of OOM in single-digit minutes. Less code, no leak.
+Same FPS as before — 20 on the same 1080p RTSP source, which is what the camera delivers (both the old and new pipeline are source-limited, not compute-limited, at this input). The leak canary on `/sys/kernel/debug/nvmap/iovmm/allocations` is flat after warmup, where the old version had it climbing 65 MB → 3.1 GB in 30 seconds. RSS plateaus well under the 5 GiB cgroup cap and stays there across multi-hour soak runs, vs. the old behavior of OOM in single-digit minutes. Less code, no leak.
+
+A caveat on the "flat" part, since I've since measured it more carefully: nvmap sits at ~206 MB steady-state under the current pipeline (Stage 2, MJPEG branch removed — see below). Earlier sub-versions had it at ~224 MB; the ~20 MB drop is from removing `nvjpegenc` + `nvdsosd` surfaces, not from any change in the source path. Direct camera and `mediamtx` relay paths both land in the same band; an earlier "the relay quadruples the baseline" reading I had was a measurement artifact, refuted by an A/B. Four minutes is too short to rule out slower growth; the original "no leak" confidence comes from the multi-hour soaks I ran earlier on the direct-camera path, not from a single benchmark. The head-to-head comparison against the Python original now has real data: a 300s concurrent run on the same relay stream with both detectors stable shows them processing 6,349 vs 6,350 frames over the window — effectively identical throughput at ~21 FPS each, with shared nvmap flat at 421 MB. Per-process VmRSS comes out at 797 MB (Python) vs 676 MB (Swift); both flat over the window. An earlier concurrent run had Python crashing partway through and Swift falling to 0.24 FPS, which I framed as VIC NVDEC contention; that framing is wrong and the current data supersedes it. The leak story in this post is solid either way — "leak vs. no leak" at 65 MB/s is not a close call.
 
 ## The slog (because it was real)
 
@@ -126,3 +128,19 @@ None of that argues against the architectural lesson — if anything it sharpens
 **Less code is the byproduct of a better fit, not the goal.** I didn't set out to delete 1,800 lines; I set out to stop the leak. The Kalman filter, the bitmap font, the letterbox — those were all me reimplementing pieces of DeepStream in Swift, and they all became unnecessary the moment Swift stopped being the renderer.
 
 The right boundary in a system like this lives wherever the data actually wants to flow. When you find yourself fighting the framework to drag data across the wrong line, the leak is the framework telling you so.
+
+---
+
+## Stage 2: deleting the video from the detector
+
+After this post went up, I kept going. The tee + MJPEG sidecar I described above — the branch that runs `nvdsosd → nvjpegenc → appsink` so a browser can pull frames — turned out to be another version of the same mistake. Not a leak this time, but the same pattern: code doing work it has no business doing.
+
+The tee was consuming about 5 ms of extra preprocess latency (31.5 → 26.2 ms baseline when I toggled `MJPEG_DISABLED=1`). That's ~10% of a 50 ms frame budget. And the only reason it existed was that I needed a way to get video to a browser.
+
+The stack already had `mediamtx` running as an RTSP relay — the camera accepts only one RTSP session, so mediamtx was already in the path to let both the detector and a second viewer see the stream. mediamtx ships WebRTC out of the box. Enabling it was a three-line config change. The browser connects via WHEP (a POST-offer / 201-answer exchange over HTTP), receives H.264 over RTP, and plays it natively. Sub-100ms latency. No GPU work in the detector at all for video.
+
+So the `tee` is gone. `nvdsosd`, `nvjpegenc`, `nvvideoconvert`, the valve, the videodrop stub, the cairo libs in the container image — all gone. `MJPEGSidecar.swift` deleted. The pipeline is now just decode → mux → infer → track → fakesink. About 400 lines of Swift removed.
+
+The bounding boxes still render. Stage 1 added a `requestVideoFrameCallback` loop that matches each presented video frame against a ring buffer of detection messages using `ptsNs` — the buffer's GStreamer PTS, propagated through the C shim and into the WebSocket JSON. When the browser gets a video frame callback with `metadata.mediaTime`, it converts that to nanoseconds, computes a calibrated offset from the first 8 frames, and picks the detection whose `ptsNs` is closest to the estimated playback PTS. The boxes are matched to the presented frame rather than trailing by the WebSocket delivery latency — on Chrome, where requestVideoFrameCallback is available.
+
+The lesson I didn't see clearly enough the first time: the MJPEG sidecar was still me trying to do NVIDIA's job. The video was already in the RTSP relay. The detector doesn't need to know about it. The final architecture removed the MJPEG branch entirely because once you have an RTSP relay already in the stack, the cheapest encoder is no encoder.
