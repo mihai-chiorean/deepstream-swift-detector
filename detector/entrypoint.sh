@@ -8,6 +8,14 @@ export GST_DEBUG="1"
 export EGL_PLATFORM="device"
 export CUDA_VER="12.6"
 
+# Metrics port — override with METRICS_PORT env var (default 9092 to avoid
+# conflict with Swift detector on 9090)
+export METRICS_PORT="${METRICS_PORT:-9092}"
+
+# Stream mux dimensions — sub-stream is 640x360
+export STREAMMUX_WIDTH="${STREAMMUX_WIDTH:-640}"
+export STREAMMUX_HEIGHT="${STREAMMUX_HEIGHT:-360}"
+
 # Clear GStreamer plugin cache to force re-scan
 rm -rf ~/.cache/gstreamer-1.0/ 2>/dev/null
 

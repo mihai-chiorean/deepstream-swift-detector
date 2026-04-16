@@ -1,9 +1,10 @@
 {
-    "appId": "sh.wendy.examples.deepstream-detector",
-    "version": "1.0.0",
+    "appId": "sh.wendy.examples.deepstream-detector-python",
+    "version": "1.1.0",
     "language": "python",
     "entitlements": [
         {"type": "gpu"},
-        {"type": "network", "mode": "host"}
+        {"type": "network", "mode": "host"},
+        {"type": "persist", "name": "detector-python-cache", "path": "/app/engines"}
     ]
 }
