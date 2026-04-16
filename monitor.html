@@ -478,6 +478,7 @@
         <div class="dp-row"><span class="dp-label">draw calls</span><span class="dp-val" id="dp-draws">0</span></div>
         <div class="dp-row"><span class="dp-label">ring size</span><span class="dp-val" id="dp-ring">0</span></div>
         <div class="dp-row"><span class="dp-label">playout delay</span><span class="dp-val" id="dp-playout">-</span></div>
+        <div class="dp-row"><span class="dp-label">lead mode</span><span class="dp-val" id="dp-leadmode">-</span></div>
     </div>
 
     <div class="container">
@@ -619,6 +620,16 @@
         let deviceHost = '';
         const useProxy = window.location.protocol !== 'file:';
 
+        // A/B overlay timing modes — set via URL hash, parsed once at page load.
+        // Reload required after changing the hash; calibration must re-run.
+        //   (no hash)        playoutDelayHint=0.15, no ptsOffset shift  [current default]
+        //   #lead=none       playoutDelayHint=0.15, subtract 50 ms from ptsOffsetNs post-calibration
+        //   #lead=low        playoutDelayHint=0.10, no ptsOffset shift
+        //   #lead=offset-only  playoutDelayHint=0,  subtract 50 ms from ptsOffsetNs post-calibration
+        const LEAD_MODES = ['none', 'low', 'offset-only'];
+        const _hashMode  = window.location.hash.replace('#lead=', '').replace('#', '');
+        const leadMode   = LEAD_MODES.includes(_hashMode) ? _hashMode : 'default';
+
         function getDetectorUrl(path) {
             return useProxy ? `/detector${path}` : `http://${deviceHost}:9090${path}`;
         }
@@ -677,6 +688,8 @@
                 log('Enter your device hostname and click Update', 'info');
             }
 
+            log(`Lead mode: ${leadMode} (hash: ${window.location.hash || '(none)'})`, 'info');
+
             // Start the canvas overlay render loop (RAF fallback for Firefox).
             if (!('requestVideoFrameCallback' in HTMLVideoElement.prototype)) {
                 log('requestVideoFrameCallback not available — using RAF fallback (overlay may not be frame-accurate)', 'warning');
@@ -734,6 +747,7 @@
                     }
                 });
             }
+            document.getElementById('dp-leadmode').textContent = leadMode;
         }
 
         // ---------------------------------------------------------------------------
@@ -815,10 +829,12 @@
                             document.getElementById('dp-rvfc').textContent = 'yes';
                             document.getElementById('dp-rvfc').className   = 'dp-val dp-ok';
                         }
-                        // Set playout buffer hint — adds ~150 ms so detection N arrives before frame N.
+                        // Set playout buffer hint — value depends on leadMode (A/B tuning).
                         if (event.receiver && 'playoutDelayHint' in event.receiver) {
-                            event.receiver.playoutDelayHint = 0.15;
-                            log('playoutDelayHint set to 150 ms (bbox sync fix)', 'info');
+                            const delayMap = { 'default': 0.15, 'none': 0.15, 'low': 0.10, 'offset-only': 0 };
+                            const hint = delayMap[leadMode] ?? 0.15;
+                            event.receiver.playoutDelayHint = hint;
+                            log(`playoutDelayHint set to ${(hint * 1000).toFixed(0)} ms (lead=${leadMode})`, 'info');
                         }
                     }
                 };
@@ -1050,6 +1066,12 @@
                     const sum = ptsOffsetSamples.reduce((a, b) => a + b, 0);
                     ptsOffsetNs = sum / ptsOffsetSamples.length;
                     ptsCalibrated = true;
+                    // For modes 'none' and 'offset-only': shift the offset back by 50 ms
+                    // to compensate for NvDCF tracker Kalman forward-prediction (~1 frame).
+                    if (leadMode === 'none' || leadMode === 'offset-only') {
+                        ptsOffsetNs -= 50_000_000;  // 50 ms in nanoseconds
+                        log(`ptsOffsetNs adjusted -50 ms for lead=${leadMode}: now ${(ptsOffsetNs / 1e6).toFixed(1)} ms`, 'info');
+                    }
                     log(`PTS offset calibrated: ${(ptsOffsetNs / 1e6).toFixed(1)} ms`, 'success');
                     console.log('[overlay] PTS offset calibrated:', ptsOffsetNs, 'ns =',
                         (ptsOffsetNs / 1e6).toFixed(1), 'ms');
