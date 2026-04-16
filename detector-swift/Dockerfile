@@ -7,9 +7,14 @@
 #
 # This Dockerfile only assembles the runtime image from the resulting
 # aarch64 binary. DeepStream, CUDA, GStreamer NVMM plugins, AND the
-# Swift runtime libs are all CDI-injected by wendy at runtime (the
-# `gpu` entitlement in wendy.json triggers nvidia-ctk CDI injection,
-# and a systemd-service-provided csv adds the Swift runtime libs).
+# Swift runtime libs are all CDI-injected by wendy at runtime.
+#
+# Stage 2 (2026-04-15): MJPEG branch removed from the detector pipeline.
+# videodrop stub, cairo-stage, and MJPEG_DISABLED are all gone.
+# Video is served by mediamtx via WebRTC. The detector only publishes
+# detection metadata via the /detections WebSocket.
+#
+# Build cache bust: 2026-04-15-stage2
 
 # swift-detector-base at 192.168.68.70:5000 is unreachable from this dev
 # host's buildx (WiFi route broken), so we use plain ubuntu:24.04 and COPY
@@ -19,19 +24,10 @@ FROM --platform=linux/arm64 ubuntu:24.04
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libcurl4 \
     kmod \
+    libgstreamer1.0-0 \
     gstreamer1.0-libav \
     gstreamer1.0-plugins-base \
     && rm -rf /var/lib/apt/lists/*
-
-# libcairo2 + transitive deps (libpixman, libfontconfig, libfreetype, libpng,
-# libxcb, libXrender, libX11, libXext, etc.) staged from the Linux_for_Tegra
-# aarch64 rootfs. Copying raw .so files is dramatically faster than apt-get
-# under qemu-binfmt emulation (12+ minutes for 2 packages vs seconds here).
-# Required by /usr/lib/gstreamer-1.0/deepstream/libnvdsgst_osd.so — which
-# provides the nvdsosd element that draws detection bboxes on the MJPEG
-# branch.
-COPY cairo-stage/ /usr/lib/aarch64-linux-gnu/
-RUN ldconfig
 
 WORKDIR /app
 
@@ -51,9 +47,6 @@ COPY yolo26n_b2_fp16.engine /app/yolo26n_b2_fp16.engine
 RUN mkdir -p /app/lib
 COPY libnvdsparsebbox_yolo26.so /app/lib/libnvdsparsebbox_yolo26.so
 
-# libnvdsparsebbox_yolo26.so is mounted via wendy.json --resources at
-# /app/lib/ at runtime (built separately on the Jetson).
-
 # LD_LIBRARY_PATH entries:
 #   /app/lib                       — custom parser .so (libnvdsparsebbox_yolo26.so)
 #   /usr/lib/swift/linux           — Swift runtime (libswiftCore etc.)
@@ -61,10 +54,7 @@ COPY libnvdsparsebbox_yolo26.so /app/lib/libnvdsparsebbox_yolo26.so
 #   /usr/local/cuda-12.6/lib       — CUDA device libs
 #   /usr/lib/aarch64-linux-gnu     — Ubuntu system libs (libc, libstdc++ etc.)
 #   /usr/share/nvidia-container-passthrough/usr/lib/aarch64-linux-gnu
-#                                  — libgstnvexifmeta.so (dependency of libgstnvjpeg.so).
-#                                    Without this path, GStreamer's registry scan
-#                                    fails to dlopen libgstnvjpeg.so and blacklists
-#                                    nvjpegenc, breaking the MJPEG sidecar pipeline.
+#                                  — CDI-injected GStreamer NVMM plugins
 ENV LD_LIBRARY_PATH=/app/lib:/usr/lib/swift/linux:/usr/lib:/usr/local/cuda-12.6/lib:/usr/lib/aarch64-linux-gnu:/usr/share/nvidia-container-passthrough/usr/lib/aarch64-linux-gnu
 
 # Enable DeepStream latency measurement APIs.

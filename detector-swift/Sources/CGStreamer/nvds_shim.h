@@ -48,22 +48,33 @@ typedef struct {
 //   decode_ms      — nvv4l2decoder: decoder input → decoder output.
 //                    Attached by nvstreammux when it reads the decoder's
 //                    GstReferenceTimestampMeta.
-//   preprocess_ms  — nvstreammux + nvinfer: mux output → nvinfer output.
-//                    nvstreammux stamps the batch enter/exit; nvinfer stamps
-//                    its own enter/exit. We sum both since together they
-//                    represent the "prepare tensor + run inference" stage.
+//   streammux_ms   — nvstreammux only: mux enter → mux exit (buffer batching,
+//                    waiting for batch to fill, pad synchronisation).
+//   inference_ms   — nvinfer only: nvinfer enter → nvinfer exit (letterbox
+//                    resize + YOLO26n forward pass + custom bbox-parser).
+//   preprocess_ms  — nvstreammux + nvinfer sum (= streammux_ms + inference_ms).
+//                    Kept for backwards compatibility; monitor.html reads this
+//                    field for "Inference latency" until the new names are live.
 //   postprocess_ms — nvtracker: tracker enter → tracker exit.
 //                    The custom bbox parser .so runs inside nvinfer's
 //                    postprocess step, but DS does not break that out as a
 //                    separate component meta. nvtracker is the closest
 //                    downstream component and captures the final association
 //                    + track-management cost.
+//   ptsNs          — GStreamer buffer PTS (presentation timestamp) in
+//                    nanoseconds, as reported by GST_BUFFER_PTS(buf).
+//                    GST_CLOCK_TIME_NONE (all bits set) means no PTS —
+//                    reported as -1 so Swift can check ptsNs < 0.
+//                    Used by Stage 2 for frame-accurate bbox overlay sync.
 // ---------------------------------------------------------------------------
 
 typedef struct {
-    double decode_ms;       // nvv4l2decoder latency (ms); 0 if unavailable
-    double preprocess_ms;   // nvstreammux + nvinfer latency (ms); 0 if unavailable
-    double postprocess_ms;  // nvtracker latency (ms); 0 if unavailable
+    double  decode_ms;       // nvv4l2decoder latency (ms); 0 if unavailable
+    double  streammux_ms;    // nvstreammux latency (ms); 0 if unavailable
+    double  inference_ms;    // nvinfer latency (ms); 0 if unavailable
+    double  preprocess_ms;   // nvstreammux + nvinfer sum (ms); kept for compat
+    double  postprocess_ms;  // nvtracker latency (ms); 0 if unavailable
+    int64_t ptsNs;           // buffer PTS in ns; -1 if GST_CLOCK_TIME_NONE
 } WendyFrameTiming;
 
 // ---------------------------------------------------------------------------
@@ -88,6 +99,9 @@ int wendy_nvds_flatten(GstBuffer *buf, WendyDetection *out, int maxOut);
 // NVDS_ENABLE_COMPONENT_LATENCY_MEASUREMENT=1; returns with all fields 0.0
 // if the metas are absent (env not set or DS version does not support it).
 //
+// Also extracts GST_BUFFER_PTS(buf) and stores it as ptsNs. Returns -1 if
+// the buffer has no PTS (GST_CLOCK_TIME_NONE).
+//
 // The function never calls gst_buffer_map and is safe to call from the
 // GStreamer streaming thread alongside wendy_nvds_flatten.
 // ---------------------------------------------------------------------------
@@ -102,7 +116,8 @@ WendyFrameTiming wendy_extract_frame_timing(GstBuffer *buf);
 // value type before bouncing via Task.detached or continuation.yield.
 //
 // timing carries per-component latency data. All fields may be 0 if
-// NVDS_ENABLE_COMPONENT_LATENCY_MEASUREMENT is not set.
+// NVDS_ENABLE_COMPONENT_LATENCY_MEASUREMENT is not set. timing.ptsNs is
+// -1 if the buffer carried no PTS.
 // ---------------------------------------------------------------------------
 
 typedef void (*WendyDetectionCallback)(int count,

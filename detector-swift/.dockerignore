@@ -1,0 +1,13 @@
+ffmpeg
+swiftly.tar.gz
+yolo26n.onnx
+*.md
+PORT_PLAN.md
+ARCHITECTURE.md
+LICENSE.txt
+.wendy
+scripts
+Sources
+Package.swift
+Package.resolved
+Dockerfile.bak

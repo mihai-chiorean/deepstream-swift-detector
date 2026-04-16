@@ -419,11 +419,21 @@ func framesProcessedCounter(stream: String) -> CounterMetric {
 
 // MARK: Histogram metrics
 
-/// End-to-end inference latency in milliseconds, per stream.
+/// nvstreammux latency in milliseconds (buffer batching), per stream.
+func streammuxLatencyHistogram(stream: String) -> HistogramMetric {
+    metrics.histogram(
+        "deepstream_streammux_latency_ms",
+        help: "nvstreammux latency in milliseconds (buffer batching + pad sync)",
+        labels: ["stream": stream],
+        buckets: latencyBuckets
+    )
+}
+
+/// nvinfer latency in milliseconds (letterbox + DNN forward pass), per stream.
 func inferenceLatencyHistogram(stream: String) -> HistogramMetric {
     metrics.histogram(
         "deepstream_inference_latency_ms",
-        help: "Inference latency in milliseconds",
+        help: "nvinfer latency in milliseconds (letterbox resize + YOLO26n forward pass)",
         labels: ["stream": stream],
         buckets: latencyBuckets
     )
