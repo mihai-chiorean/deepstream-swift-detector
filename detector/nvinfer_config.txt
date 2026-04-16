@@ -1,13 +1,14 @@
 [property]
 gpu-id=0
 net-scale-factor=0.0039215697906911373
-onnx-file=/app/yolo11n.onnx
-model-engine-file=/app/engines/model_b2_gpu0_fp16.engine
+# onnx-file disabled: using pre-built yolo26n_b2_fp16 engine
+model-engine-file=/app/yolo26n_b2_fp16.engine
 labelfile-path=/app/labels.txt
-batch-size=2
+batch-size=1
 network-mode=2
 num-detected-classes=80
-interval=1
+# Match Swift: process every frame (interval=0). Was 1 (skip every other) under YOLO11.
+interval=0
 gie-unique-id=1
 process-mode=1
 
@@ -15,7 +16,7 @@ process-mode=1
 network-type=0
 
 # Cluster mode: 2=NMS (required for YOLO)
-cluster-mode=2
+cluster-mode=4
 
 # YOLO11 uses center padding - REQUIRED for proper detection
 maintain-aspect-ratio=1
@@ -28,17 +29,19 @@ model-color-format=0
 # Required when ONNX has dynamic dimensions (exported with --dynamic)
 infer-dims=3;640;640
 
-# Force implicit batch dimension (required for dynamic ONNX models)
-force-implicit-batch-dim=1
+# Pre-built YOLO26 engine uses explicit batch — match Swift detector.
+# Implicit-batch=1 against an explicit-batch engine triggers a TRT
+# binding-shape assert during nvinfer init.
+force-implicit-batch-dim=0
 
-# Custom YOLO library from https://github.com/marcoslucianops/DeepStream-Yolo
-custom-lib-path=/app/lib/libnvdsinfer_custom_impl_Yolo.so
+# Custom YOLO26 bbox parser (shared with detector-swift). The engine itself
+# is pre-built; this .so only exports the bbox parse function — it does NOT
+# export NvDsInferYoloCudaEngineGet. Setting engine-create-func-name here
+# would cause nvinfer to dlsym a NULL and crash at PLAY transition.
+custom-lib-path=/app/lib/libnvdsparsebbox_yolo26.so
 
-# Custom engine builder - builds TensorRT engine with YOLO optimizations
-engine-create-func-name=NvDsInferYoloCudaEngineGet
-
-# Custom parse function - parses YOLO output tensors
-parse-bbox-func-name=NvDsInferParseYolo
+# Custom parse function - parses YOLO26 output tensor [1, 300, 6]
+parse-bbox-func-name=NvDsInferParseYolo26
 
 [class-attrs-all]
 nms-iou-threshold=0.45
