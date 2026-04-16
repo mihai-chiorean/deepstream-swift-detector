@@ -232,6 +232,32 @@ libnvdsparsebbox_yolo26.so on the relayed stream1. No model/stream confounds.
 > uptime). Hypothesis: both detectors hit a plateau a couple of hundred MB
 > above their just-started baselines. Not measured to convergence.
 
+### Per-Process CPU (300s, 60 samples @ 5s)
+
+Sampled 2026-04-16 21:02-21:07 UTC via `/proc/<pid>/stat` deltas (sum across
+all threads of the TGID). CSV: `docs/benchmark-data/cpu-sample-300s.csv`.
+
+| Stat | Swift CPU% | Python CPU% | Notes |
+|---|---|---|---|
+| mean | 26.60 | 52.13 | **Python uses 1.96x the CPU of Swift for identical throughput** |
+| min | 23.80 | 47.20 | Tight bands -- both are at steady-state, neither is bursty |
+| max | 29.00 | 56.80 | |
+| 5-min RSS drift | 264 kB | -17,872 kB | Python freed ~17 MB during the window (likely interpreter heap GC); Swift flat |
+
+> **The CPU delta is the cleanest language-layer signal in the report.** Both
+> detectors handle the same 21 fps stream with the same nvinfer engine,
+> custom parser, and tracker. The accelerator stages (NVDEC, nvinfer, nvtracker)
+> are identical bytes in both pipelines. The 25 percentage-point CPU gap
+> therefore lives in the host process: Python interpreter + pyds bindings +
+> per-frame metadata marshalling vs. Swift's compiled C-shim pad probe and
+> typed `DetectionFrame` flow.
+>
+> Caveats: percentages are "% of one CPU core" (per-thread sum), not "% of
+> system." A 6-core system with 600% headroom -- nobody is CPU-bound here.
+> The interesting fact is the *ratio*, not the absolute values. The 5-min
+> sample window is well after both detectors' warmup; values are stable
+> across the entire window (no monotonic trend).
+
 ### nvmap iovmm -- SHARED (critical leak canary)
 
 | Stat | Value | Notes |
@@ -345,6 +371,7 @@ Columns: `timestamp, fps, vmrss_kb, nvmap_kb, gpu_util_pct, gpu_power_w, gpu_ram
 | FPS (gauge mean) | 20.4 | 19.97 / 0.24 (Py / Sw) | 20.54 | 20.42 |
 | FPS (frame-delta over window) | n/a | n/a | 21.16 | 21.17 |
 | Frames in 300s window | n/a | n/a | 6,349 | 6,350 |
+| **Per-process CPU% (300s mean, % of one core)** | n/a | n/a | **52.13** | **26.60** |
 | VmRSS (mean, kB) | 561,482 | 642,703 / 560,770 | 796,605 | 676,268 |
 | VmRSS drift over window | flat | flat (then crash) | +0.07% | 0.00% |
 | nvmap iovmm (kB) | 224,484 (flat) | 421,520 (flat, shared) | 421,520 (flat, shared) | 421,520 (flat, shared) |
