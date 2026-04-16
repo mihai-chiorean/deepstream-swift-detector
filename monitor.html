@@ -468,7 +468,7 @@
                 <img id="video-stream"
                      src=""
                      alt="Live video stream with detections"
-                     onerror="this.style.display='none'; document.getElementById('video-error').style.display='block';">
+                     onerror="document.getElementById('video-error').style.display='block'; setTimeout(() => { this.src = getDetectorUrl('/stream') + '?retry=' + Date.now(); document.getElementById('video-error').style.display='none'; }, 2000);">
                 <div id="video-error" class="video-error" style="display: none;">
                     <p>Stream unavailable - enter device hostname above</p>
                 </div>
@@ -597,9 +597,12 @@
                     document.getElementById('detector-tracks').textContent = parseInt(tracksMatch[1]);
                 }
 
-                // Parse inference latency (avg = sum / count)
-                const infSumMatch = data.match(/deepstream_inference_latency_ms_sum\{[^}]*\}\s+([\d.]+)/);
-                const infCountMatch = data.match(/deepstream_inference_latency_ms_count\{[^}]*\}\s+(\d+)/);
+                // Parse inference latency (avg = sum / count).
+                // We read preprocess_latency_ms since that's where nvinfer's
+                // forward pass actually runs (component meta from DS 7.1 groups
+                // nvstreammux + nvinfer into one "preprocess" bucket).
+                const infSumMatch = data.match(/deepstream_preprocess_latency_ms_sum\{[^}]*\}\s+([\d.]+)/);
+                const infCountMatch = data.match(/deepstream_preprocess_latency_ms_count\{[^}]*\}\s+(\d+)/);
                 if (infSumMatch && infCountMatch) {
                     const sum = parseFloat(infSumMatch[1]);
                     const count = parseInt(infCountMatch[1]);
@@ -652,7 +655,9 @@
                     document.getElementById('gpu-util').textContent = `${parseFloat(utilMatch[1]).toFixed(0)}%`;
                 }
 
-                const memMatch = data.match(/jetson_gpu_memory_used_mb\s+([\d.]+)/);
+                // On Jetson Orin GPU memory is unified with system RAM, so
+                // jetson_ram_used_mb is the effective "GPU memory" figure.
+                const memMatch = data.match(/jetson_ram_used_mb\s+([\d.]+)/);
                 if (memMatch) {
                     const memMB = parseFloat(memMatch[1]);
                     document.getElementById('gpu-mem').textContent = `${(memMB / 1024).toFixed(2)} GB`;

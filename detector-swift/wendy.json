@@ -9,7 +9,8 @@
             "labels.txt:/app/labels.txt",
             "yolo26n.onnx:/app/yolo26n.onnx",
             "yolo26n_b2_fp16.engine:/app/yolo26n_b2_fp16.engine",
-            "ffmpeg:/app/ffmpeg"
+            "ffmpeg:/app/ffmpeg",
+            "libnvdsparsebbox_yolo26.so:/app/lib/libnvdsparsebbox_yolo26.so"
         ]
     },
     "entitlements": [

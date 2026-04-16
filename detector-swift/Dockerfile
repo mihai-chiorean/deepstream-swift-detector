@@ -21,9 +21,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     kmod \
     gstreamer1.0-libav \
     gstreamer1.0-plugins-base \
-    libcairo2 \
-    libjsoncpp25 \
     && rm -rf /var/lib/apt/lists/*
+
+# libcairo2 + transitive deps (libpixman, libfontconfig, libfreetype, libpng,
+# libxcb, libXrender, libX11, libXext, etc.) staged from the Linux_for_Tegra
+# aarch64 rootfs. Copying raw .so files is dramatically faster than apt-get
+# under qemu-binfmt emulation (12+ minutes for 2 packages vs seconds here).
+# Required by /usr/lib/gstreamer-1.0/deepstream/libnvdsgst_osd.so — which
+# provides the nvdsosd element that draws detection bboxes on the MJPEG
+# branch.
+COPY cairo-stage/ /usr/lib/aarch64-linux-gnu/
+RUN ldconfig
 
 WORKDIR /app
 
@@ -58,6 +66,22 @@ COPY libnvdsparsebbox_yolo26.so /app/lib/libnvdsparsebbox_yolo26.so
 #                                    fails to dlopen libgstnvjpeg.so and blacklists
 #                                    nvjpegenc, breaking the MJPEG sidecar pipeline.
 ENV LD_LIBRARY_PATH=/app/lib:/usr/lib/swift/linux:/usr/lib:/usr/local/cuda-12.6/lib:/usr/lib/aarch64-linux-gnu:/usr/share/nvidia-container-passthrough/usr/lib/aarch64-linux-gnu
+
+# Enable DeepStream latency measurement APIs.
+#
+# NVDS_ENABLE_LATENCY_MEASUREMENT=1 causes nvds_measure_buffer_latency() to
+# populate NvDsFrameLatencyInfo (end-to-end frame latency from decoder input).
+#
+# NVDS_ENABLE_COMPONENT_LATENCY_MEASUREMENT=1 causes each pipeline component
+# (nvv4l2decoder, nvstreammux, nvinfer, nvtracker, etc.) to attach an
+# NvDsMetaCompLatency user-meta entry to the batch with its own
+# in_system_timestamp / out_system_timestamp. The C shim reads these in
+# wendy_extract_frame_timing() and maps them to our three Prometheus buckets:
+#   deepstream_decode_latency_ms     — nvv4l2decoder
+#   deepstream_preprocess_latency_ms — nvstreammux + nvinfer
+#   deepstream_postprocess_latency_ms— nvtracker
+ENV NVDS_ENABLE_LATENCY_MEASUREMENT=1
+ENV NVDS_ENABLE_COMPONENT_LATENCY_MEASUREMENT=1
 
 EXPOSE 9090
 

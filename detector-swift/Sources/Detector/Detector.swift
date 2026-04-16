@@ -128,6 +128,11 @@ private func runStreamDetectionLoop(
 
     let fps = fpsGauge(stream: stream.name)
     let framesProcessed = framesProcessedCounter(stream: stream.name)
+    let activeTracks = activeTracksGauge(stream: stream.name)
+    let totalLatency = totalLatencyHistogram(stream: stream.name)
+    let decodeLatency = decodeLatencyHistogram(stream: stream.name)
+    let preprocessLatency = preprocessLatencyHistogram(stream: stream.name)
+    let postprocessLatency = postprocessLatencyHistogram(stream: stream.name)
     var classCounterCache: [String: CounterMetric] = [:]
     var frameCount: UInt64 = 0
     var fpsWindowStart = ContinuousClock.now
@@ -149,7 +154,8 @@ private func runStreamDetectionLoop(
             logger.warning("No MJPEG appsink in pipeline — /stream will not produce frames")
         }
 
-        for await detections in detectionStream {
+        for await frame in detectionStream {
+            let detections = frame.detections
             let currentTrackerIds = Set(detections.compactMap(\.trackId))
             let disappearedIds = previousTrackerIds.subtracting(currentTrackerIds)
             for goneId in disappearedIds {
@@ -159,6 +165,26 @@ private func runStreamDetectionLoop(
 
             frameCount += 1
             framesProcessed.inc()
+
+            // Per-frame gauges + histograms.
+            activeTracks.set(Double(currentTrackerIds.count))
+            if frame.frameLatencyNs > 0 {
+                totalLatency.observe(Double(frame.frameLatencyNs) / 1_000_000.0)  // ns → ms
+            }
+
+            // DeepStream component latency histograms.
+            // These are non-zero only when NVDS_ENABLE_COMPONENT_LATENCY_MEASUREMENT=1.
+            // The C shim fills them from NVDS_LATENCY_MEASUREMENT_META batch user-metas.
+            let t = frame.timing
+            if t.decodeMs > 0 {
+                decodeLatency.observe(t.decodeMs)
+            }
+            if t.preprocessMs > 0 {
+                preprocessLatency.observe(t.preprocessMs)
+            }
+            if t.postprocessMs > 0 {
+                postprocessLatency.observe(t.postprocessMs)
+            }
 
             var classCounts: [Int: Int] = [:]
             for det in detections {

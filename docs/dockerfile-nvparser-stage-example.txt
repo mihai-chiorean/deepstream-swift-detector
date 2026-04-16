@@ -1,0 +1,220 @@
+NVPARSER STAGE — THREE-STAGE DOCKERFILE EXAMPLE
+================================================
+
+STATUS: Not yet usable.  Preserved for when a pullable DeepStream base image
+becomes available.
+
+BLOCKER
+-------
+Stage 0 (nvparser) is based on dustynv/l4t-deepstream:r36.4.0.  This image
+is not publicly pullable from Docker Hub (hub access denied, dustynv's
+third-party builds require direct pull or a mirror).  Until a pullable image
+with DeepStream SDK headers at:
+
+    /opt/nvidia/deepstream/deepstream/sources/includes/
+
+is available, the nvparser stage cannot run inside docker buildx.
+
+THE IDEA BEING PRESERVED
+-------------------------
+Today (2026-04-15) the host-side build flow requires a manual step:
+
+    clang++ --target=aarch64-linux-gnu \
+        -I ~/jetson/Linux_for_Tegra/.../deepstream-7.1/sources/includes/ \
+        ...
+        -o libnvdsparsebbox_yolo26.so \
+        Sources/CNvdsParser/nvdsparsebbox_yolo26.cpp
+
+This nvparser stage replaces that host step: it builds the YOLO26 bbox parser
+.so inside docker from an image that already has the DeepStream headers, then
+uses COPY --from=nvparser to bring it into the runtime stage.  The host no
+longer needs a cross-compiler or a local L4T tree just for the parser.
+
+When the blocker is resolved (a pullable nvcr.io or NVIDIA NGC image with
+DeepStream headers, or a self-hosted mirror of dustynv's image), activate this
+by replacing the live Dockerfile with the three-stage version below.
+
+ALTERNATIVE BASE IMAGES TO TRY
+-------------------------------
+- nvcr.io/nvidia/deepstream:7.1-gc-triton-devel   (NGC, requires login)
+- nvcr.io/nvidia/deepstream:7.1-samples            (NGC, requires login)
+- A locally-built image FROM nvcr.io/nvidia/l4t-jetpack:r36.4.0 with
+  deepstream-7.1 installed via NVIDIA's apt repo (adds ~2 GB but gives headers)
+
+======================================================================
+THREE-STAGE DOCKERFILE (extracted from Dockerfile.my-attempt, 2026-04-15)
+======================================================================
+
+# ============================================================
+# Stage 0: Build the YOLO26 bbox parser shared object.
+#
+# Uses dustynv/l4t-deepstream:r36.4.0 because it ships the
+# DeepStream SDK headers at the canonical path:
+#   /opt/nvidia/deepstream/deepstream/sources/includes
+# The Makefile accepts DEEPSTREAM_INCLUDES as an override;
+# the default in the Makefile is that same path, so passing
+# it explicitly here is belt-and-suspenders but harmless.
+# Output: /src/libnvdsparsebbox_yolo26.so
+# ============================================================
+FROM dustynv/l4t-deepstream:r36.4.0 AS nvparser
+COPY Sources/CNvdsParser /src
+WORKDIR /src
+RUN make DEEPSTREAM_INCLUDES=/opt/nvidia/deepstream/deepstream/sources/includes
+
+# ============================================================
+# Stage 1: Build the Swift binary.
+# Uses the WendyOS/L4T JetPack builder image which has TensorRT,
+# CUDA headers, and the NVIDIA multimedia headers needed for the
+# CDI-injected libs.
+# ============================================================
+FROM nvcr.io/nvidia/l4t-jetpack:r36.2.0 AS builder
+
+# Install build-time dependencies.
+# GStreamer dev packages are needed to compile the CGStreamer
+# system-library target.
+RUN DEBIAN_FRONTEND=noninteractive apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    curl libxml2 libcurl4 libedit2 libsqlite3-0 libc6-dev binutils \
+    libgcc-11-dev libstdc++-11-dev zlib1g-dev pkg-config git \
+    libturbojpeg0-dev \
+    libavformat-dev libavcodec-dev libavutil-dev libswscale-dev \
+    libgstreamer1.0-dev \
+    libgstreamer-plugins-base1.0-dev \
+    libgstreamer-plugins-bad1.0-dev \
+    libcurl4-openssl-dev libxml2-dev libz3-dev tzdata \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Swift 6.2.3 toolchain directly from swift.org.
+# Download the pre-built aarch64 Linux tarball and extract to /opt/swift.
+# This avoids swiftly entirely (swiftly bootstrap binary in swiftly.tar.gz is
+# x86_64 and cannot run in the aarch64 build environment).
+RUN SWIFT_URL=https://download.swift.org/swift-6.2.3-release/ubuntu2204-aarch64/swift-6.2.3-RELEASE/swift-6.2.3-RELEASE-ubuntu22.04-aarch64.tar.gz \
+    && curl -fsSL "$SWIFT_URL" -o /tmp/swift.tar.gz \
+    && mkdir -p /opt/swift \
+    && tar -xzf /tmp/swift.tar.gz -C /opt/swift --strip-components=1 \
+    && rm /tmp/swift.tar.gz \
+    && /opt/swift/usr/bin/swift --version
+ENV PATH="/opt/swift/usr/bin:${PATH}"
+
+WORKDIR /build
+COPY Package.swift Package.resolved ./
+COPY Sources/ Sources/
+
+# Resolve dependencies first for better layer caching
+RUN swift package resolve
+
+# Build release binary.
+# Pass GStreamer/GLib include paths explicitly because the CGStreamer system
+# library target has no pkgConfig (to avoid breaking cross-compilation with
+# the wendyos SDK where headers come from -isystem flags in toolset.json).
+RUN swift build -c release --scratch-path /tmp/.build \
+    -Xcc -I/usr/include/gstreamer-1.0 \
+    -Xcc -I/usr/include/glib-2.0 \
+    -Xcc -I/usr/lib/aarch64-linux-gnu/glib-2.0/include \
+    -Xcc -I/usr/include/gstreamer-1.0/gst/app \
+    -Xlinker -L/usr/local/cuda/targets/aarch64-linux/lib/stubs \
+    -Xlinker -L/usr/local/cuda/targets/aarch64-linux/lib \
+    -Xlinker -lcuda
+
+# ============================================================
+# Stage 2: Minimal runtime image (Ubuntu 24.04, glibc 2.39 --
+# compatible with the WendyOS host glibc 2.39 for CDI-injected
+# GStreamer 1.22 core libs).
+#
+# Base image: 192.168.68.70:5000/swift-detector-base:latest
+#   - Ubuntu 24.04 + CUDA
+#   - GStreamer core libs injected at container runtime via CDI
+#     (nvidia-ctk cdi generate).  These are NOT installed here.
+#
+# ASSUMPTION: CDI injects GStreamer NVMM plugins
+#   (nvv4l2decoder, nvstreammux, nvinfer, nvtracker, nvjpegenc ...)
+#   and their DeepStream runtime libraries along with GStreamer
+#   core.  If the CDI manifest only covers V4L2/multimedia shims
+#   and NOT the full DeepStream plugin set, install
+#   deepstream-7.1 from NVIDIA's apt repo below -- see the
+#   commented-out block marked RISK.
+#
+# ASSUMPTION: /opt/nvidia/deepstream/deepstream-7.1/lib/ is
+#   present at runtime (either via CDI or a host bind-mount).
+#   The smoke-test command in PORT_PLAN.md section 2 references
+#   ll-lib-file=/opt/nvidia/deepstream/deepstream-7.1/lib/
+#   libnvds_nvmultiobjecttracker.so -- that path must resolve.
+#   Verify on the Jetson with:
+#     ls /opt/nvidia/deepstream/deepstream-7.1/lib/libnvds_nvmultiobjecttracker.so
+#   inside the running container.
+# ============================================================
+FROM 192.168.68.70:5000/swift-detector-base:latest
+
+# Install GStreamer plugin runtime packages and hw-decode dependencies.
+# The pipeline:
+#   rtspsrc ! rtph264depay ! h264parse
+#     ! nvv4l2decoder
+#     ! nvstreammux
+#     ! nvinfer    (loads custom parser via /app/lib/libnvdsparsebbox_yolo26.so)
+#     ! nvtracker  (NvDCF, loads libnvds_nvmultiobjecttracker.so)
+#     ! fakesink
+#
+# nvv4l2decoder, nvinfer, nvtracker, nvjpegenc come from NVIDIA's
+# DeepStream GStreamer plugins -- see ASSUMPTION above.
+#
+# kmod: libnvtvmr.so shells out to `lsmod | grep nvgpu` during codec
+# init. Without /sbin/lsmod the library aborts and nvv4l2decoder fails.
+# (ref: forums.developer.nvidia.com/t/364611)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gstreamer1.0-plugins-good \
+    gstreamer1.0-plugins-bad \
+    gstreamer1.0-plugins-base \
+    gstreamer1.0-tools \
+    libgstreamer-plugins-base1.0-0 \
+    libgstreamer-plugins-bad1.0-0 \
+    ffmpeg \
+    libturbojpeg \
+    libcurl4 \
+    kmod \
+    v4l-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+# RISK: If CDI does NOT inject DeepStream runtime libs, uncomment
+# and adapt the block below to install them from NVIDIA's apt repo.
+# You must add the repo key + sources list for nv-tensorrt and
+# deepstream-7.1 first; example (untested -- verify on Jetson):
+#
+#   RUN apt-get update && apt-get install -y --no-install-recommends \
+#       deepstream-7.1 \
+#       && rm -rf /var/lib/apt/lists/*
+#
+# deepstream-7.1 installs to /opt/nvidia/deepstream/deepstream-7.1/
+# and provides libnvds_nvmultiobjecttracker.so, libnvdsgst_infer.so,
+# and the rest of the nvinfer/nvtracker runtime.
+
+WORKDIR /app
+RUN mkdir -p /app/lib
+
+# Copy the custom YOLO26 bbox parser built in the nvparser stage.
+# nvinfer_config.txt references: custom-lib-path=/app/lib/libnvdsparsebbox_yolo26.so
+COPY --from=nvparser /src/libnvdsparsebbox_yolo26.so /app/lib/libnvdsparsebbox_yolo26.so
+
+# Copy the compiled Swift binary
+COPY --from=builder /tmp/.build/release/Detector /app/
+
+# Copy Swift runtime libraries (the binary is dynamically linked)
+COPY --from=builder /opt/swift/usr/lib/swift/linux/*.so \
+    /usr/lib/swift/linux/
+
+# Copy model, label, and stream configuration files.
+COPY labels.txt /app/
+COPY streams.json /app/
+COPY nvinfer_config.txt /app/
+COPY tracker_config.yml /app/
+
+# Library search path:
+#   1. /app/lib                   -- custom parser .so (libnvdsparsebbox_yolo26.so)
+#   2. /usr/lib/swift/linux       -- Swift runtime (libswiftCore etc.)
+#   3. /usr/lib                   -- CDI-injected TensorRT, CUDA, GStreamer core
+#   4. /usr/local/cuda-12.6/lib   -- CUDA libs
+#   5. /usr/lib/aarch64-linux-gnu -- Ubuntu system libs (libc, libstdc++ etc.)
+ENV LD_LIBRARY_PATH=/app/lib:/usr/lib/swift/linux:/usr/lib:/usr/local/cuda-12.6/lib:/usr/lib/aarch64-linux-gnu
+
+EXPOSE 9090
+
+CMD ["/app/Detector"]
