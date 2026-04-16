@@ -1002,9 +1002,10 @@ def main():
         logger.info("VLM client not installed - running without descriptions")
 
     # Start metrics server (with VLM integration for API endpoints)
-    metrics_server = MetricsServer(port=9090, vlm_integration=vlm_integration)
+    metrics_port = int(os.environ.get('METRICS_PORT', '9090'))
+    metrics_server = MetricsServer(port=metrics_port, vlm_integration=vlm_integration)
     metrics_server.start()
-    logger.info("VLM descriptions API available at http://0.0.0.0:9090/api/vlm_descriptions")
+    logger.info(f"VLM descriptions API available at http://0.0.0.0:{metrics_port}/api/vlm_descriptions")
 
     # Create pipeline
     logger.info("Creating DeepStream pipeline...")
@@ -1030,8 +1031,10 @@ def main():
     nvvidconv.set_property('copy-hw', 2)
 
     # Configure streammux (GPU-based batching)
-    streammux.set_property('width', 1920)
-    streammux.set_property('height', 1080)
+    mux_width = int(os.environ.get('STREAMMUX_WIDTH', '1920'))
+    mux_height = int(os.environ.get('STREAMMUX_HEIGHT', '1080'))
+    streammux.set_property('width', mux_width)
+    streammux.set_property('height', mux_height)
     streammux.set_property('batch-size', len(enabled_streams))
     streammux.set_property('batched-push-timeout', 40000)
     streammux.set_property('live-source', True)
@@ -1178,7 +1181,7 @@ def main():
 
     # Start pipeline
     logger.info("Starting pipeline...")
-    logger.info("Metrics available at http://0.0.0.0:9090/metrics")
+    logger.info(f"Metrics available at http://0.0.0.0:{metrics_port}/metrics")
     ret = pipeline.set_state(Gst.State.PLAYING)
 
     if ret == Gst.StateChangeReturn.FAILURE:

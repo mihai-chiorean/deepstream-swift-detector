@@ -2,7 +2,7 @@
 gpu-id=0
 net-scale-factor=0.0039215697906911373
 onnx-file=/app/yolo11n.onnx
-model-engine-file=/app/model_b2_gpu0_fp16.engine
+model-engine-file=/app/engines/model_b2_gpu0_fp16.engine
 labelfile-path=/app/labels.txt
 batch-size=2
 network-mode=2
