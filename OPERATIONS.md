@@ -60,22 +60,28 @@ survives reboots on both sides.
 ## Monitor UI + proxy
 
 `monitor.html` is a static page with vanilla JS that reads Prometheus
-metrics and streams MJPEG from the detector. It's served by
+metrics, subscribes to the `/detections` WebSocket, and plays video
+via a WebRTC `<video>` element (Stage 2). It's served by
 `monitor_proxy.py` — a stdlib Python reverse proxy running on
 `edge-builder-1`.
 
 ### What the proxy does
 
 ```
-GET /                  → serves monitor.html from the repo root
-GET /detector/<path>   → proxies to http://10.42.0.2:9090/<path>
-GET /gpu/<path>        → proxies to http://10.42.0.2:9091/<path>
+GET /                       → serves monitor.html from the repo root
+GET /detector/<path>        → proxies to http://10.42.0.2:9090/<path>
+GET /gpu/<path>             → proxies to http://10.42.0.2:9091/<path>
+POST /webrtc/<path>/whep    → proxies to http://10.42.0.2:8889/<path>/whep (WHEP signalling only)
+GET /detector/detections    → WebSocket splice (Upgrade handled via raw TCP)
 ```
 
-Streaming responses (`multipart/x-mixed-replace`) are forwarded chunked,
-never buffered, so MJPEG arrives live. Same-origin under port 8001, so
-no CORS concerns from the browser. The proxy binds `0.0.0.0` so it's
-reachable from the Mac over either ethernet or WiFi.
+Streaming responses (`multipart/x-mixed-replace` — legacy, no longer
+used by the Swift detector) are forwarded chunked, never buffered.
+WebSocket upgrades on `/detector/detections` are spliced at the TCP
+layer. WebRTC media (UDP on `:8189`) does **not** go through the
+proxy — ICE advertises the Jetson's addresses directly and the
+browser's WebRTC stack connects peer-to-peer over WiFi. Only WHEP
+signalling is proxied. Same-origin under port 8001, so no CORS.
 
 ### Starting / maintaining the proxy
 
@@ -104,24 +110,73 @@ Environment overrides (defaults shown):
 ### monitor.html behavior
 
 The JS detects `window.location.protocol !== 'file:'` and uses same-origin
-paths `/detector/...` and `/gpu/...`. The device-input box is preserved
-for backwards compat (loading the file directly via `file://`), but is
-ignored when served through the proxy.
+paths `/detector/...`, `/gpu/...`, and `/webrtc/...`. The device-input
+box is preserved for backwards compat (loading the file directly via
+`file://`), but is ignored when served through the proxy.
 
-The `<img id="video-stream">` tag has an `onerror` retry: if the stream
-fails, it waits 2 s and re-sets `src` with a `?retry=<timestamp>` param
-to bust any browser connection cache. So a transient detector restart
-clears itself — no manual reload needed.
+Video is a `<video>` element driven by a WHEP POST (`POST
+/webrtc/relayed/whep`). Detections arrive on a WebSocket
+(`/detector/detections`) and draw on a `<canvas>` overlay aligned via
+`requestVideoFrameCallback` (Chrome) or RAF (Firefox) using the
+detection message's `ptsNs`. If the video element errors, the JS
+retries the WHEP handshake.
+
+## Video delivery (Stage 2, WebRTC / WHEP)
+
+Stage 2 (2026-04-15) replaced the detector's MJPEG branch with a
+mediamtx-backed WebRTC feed. The detector no longer encodes JPEGs.
+
+**Components on the Jetson:**
+
+- `mediamtx` (systemd unit) — ingests `rtsp://192.168.68.69:554/stream1`
+  once and publishes it as:
+  - `rtsp://10.42.0.2:8554/relayed` — for any RTSP consumer (Swift
+    detector, Python detector, ffprobe, etc.). Never hit the camera
+    directly; it is single-session.
+  - `http://10.42.0.2:8889/relayed/whep` — WHEP endpoint for browser
+    `<video>` clients. RTP repacketization only, no transcode.
+  - `http://10.42.0.2:9997/v3/paths/list` — mediamtx HTTP API, useful
+    for "is the relay live?" checks.
+
+**Browser flow:**
+
+1. `<video>` element POSTs an SDP offer to `/webrtc/relayed/whep` (proxied
+   to `:8889`).
+2. mediamtx replies `201 Created` with an SDP answer.
+3. ICE candidates advertise `10.42.0.2:8189` and `192.168.68.70:8189`.
+4. Browser picks the WiFi-reachable candidate (`.68.70`) and UDP media
+   flows peer-to-peer Jetson → browser over WiFi.
+
+**Port `:8189/udp`** is the media plane. The dev-host proxy is not in the
+path — the browser talks to the Jetson directly once WHEP signalling
+has established the session.
+
+**Verify mediamtx is publishing:**
+
+```bash
+systemctl is-active mediamtx                                     # on the Jetson
+curl -s http://10.42.0.2:9997/v3/paths/list | jq '.items[].name' # should list "relayed"
+timeout 3 curl -sfI -X OPTIONS rtsp://10.42.0.2:8554/relayed     # RTSP reachable
+```
+
+**Browser compatibility:** Chrome / Safari use `requestVideoFrameCallback`
+for frame-accurate overlay sync. Firefox falls back to `requestAnimationFrame`
+(degraded sync — boxes may trail by ~1 frame).
 
 ## Jetson services at a glance
 
 | port | service | under | notes |
 |---|---|---|---|
 | `22` | sshd | systemd | primary access |
-| `5000` | container registry | containerd task | receiver for `swift package build-container-image` push |
+| `5000` | container registry | containerd task | containerd registry target for `wendy run`'s buildx → registry push |
 | `8090` | VLM sidecar (llama-server, Qwen3-VL) | Docker (`llama-vlm`) | optional; hold ~2 GB unified memory when running |
-| `9090` | Swift detector HTTP | containerd task `detector-swift` | `/metrics`, `/stream`, `/healthz`, `/api/vlm_*` |
+| `8554` | RTSP relay (mediamtx) | systemd `mediamtx.service` | `/relayed` — both detectors consume this |
+| `8889` | WebRTC / WHEP (mediamtx) | systemd `mediamtx.service` | `/relayed/whep` — browser video |
+| `8189/udp` | WebRTC media (mediamtx) | systemd `mediamtx.service` | ICE-advertised; browser ↔ Jetson direct |
+| `9090` | Swift detector HTTP | containerd task `detector-swift` | `/metrics`, `/detections` (WebSocket), `/healthz`, `/api/vlm_*` |
 | `9091` | tegrastats exporter | systemd `tegrastats-exporter.service` | Prometheus CPU/GPU/temp gauges |
+| `9092` | Python detector HTTP (if deployed) | containerd task `deepstream-vision` | `/metrics`; currently unstable — see `docs/HANDOFF.md` §9 |
+| `9997` | mediamtx HTTP API | systemd `mediamtx.service` | `/v3/paths/list` etc. |
 
 ## Device-access reference
 
@@ -151,8 +206,8 @@ it ever changes.)
 
 ### Restarting the container registry
 
-If `swift package build-container-image` fails with a connection-refused
-on port 5000, the registry container's task has stopped:
+If a `wendy run` push fails with a connection-refused on port 5000, the
+registry container's task has stopped:
 
 ```bash
 ssh root@10.42.0.2 '
@@ -179,31 +234,33 @@ ssh root@10.42.0.2 'docker update --restart unless-stopped llama-vlm && docker s
 
 ### Stopping / starting the detector
 
+The current build/deploy workflow uses `wendy run` against a project-local
+`detector-swift/Dockerfile`. There is no `swift package build-container-image`
+path anymore — that CLI is gone as of the Stage 1 / Stage 2 work. Engine
+files, the custom parser, and config files are `COPY`'d into the image at
+Dockerfile build time, not mounted via `--resources` at runtime.
+
 ```bash
 # stop
-ssh root@10.42.0.2 'ctr -n default tasks kill -s SIGKILL detector-swift; sleep 2
-                    ctr -n default tasks delete detector-swift
-                    ctr -n default containers delete detector-swift'
+ssh root@10.42.0.2 'ctr -n default tasks rm detector-swift 2>/dev/null
+                    ctr -n default containers rm detector-swift 2>/dev/null'
 
-# start (note: does NOT rebuild Swift code — must swift build first)
-cd ~/workspace/samples/deepstream-vision/detector-swift
-source ~/.local/share/swiftly/env.sh
-swift build --swift-sdk 6.2.3-RELEASE_wendyos_aarch64 -c release
-swift package --swift-sdk 6.2.3-RELEASE_wendyos_aarch64 --allow-network-connections all \
-  build-container-image --from 10.42.0.2:5000/swift-detector-base:latest \
-  --allow-insecure-http both --product Detector \
-  --repository 10.42.0.2:5000/detector-swift --architecture arm64 \
-  --resources streams.json:/app/streams.json \
-  --resources labels.txt:/app/labels.txt \
-  --resources yolo26n.onnx:/app/yolo26n.onnx \
-  --resources yolo26n_b2_fp16.engine:/app/yolo26n_b2_fp16.engine \
-  --resources ffmpeg:/app/ffmpeg
-WENDY_AGENT=10.42.0.2 wendy run -y --detach  # omit --restart-unless-stopped on untrusted builds
+# build (cross-compile x86 → aarch64; note the `-device` in the SDK name)
+cd /home/mihai/workspace/samples/deepstream-vision/detector-swift
+PATH="$HOME/.local/share/swiftly/bin:$PATH" swift build \
+  --swift-sdk 6.2.3-RELEASE_wendyos-device_aarch64 --product Detector -c release
+
+# deploy (wendy run handles buildx + push + ctr run)
+WENDY_AGENT=10.42.0.2 wendy run -y --detach   # omit --restart-unless-stopped on untrusted builds
 
 # apply cgroup cap (MANDATORY — oom_score_adj defaults to -998 otherwise,
 # which means OOM kills networking before the detector)
 ssh root@10.42.0.2 'CONTAINER=detector-swift /usr/local/bin/detector-cap'
 ```
+
+See `docs/HANDOFF.md` §3 for the authoritative copy and §10 for the list
+of deploy gotchas (BuildKit cache, disk pressure, `--restart-unless-stopped`
+footgun).
 
 ## Quick-check recipes
 
@@ -213,15 +270,19 @@ curl -s http://10.42.0.2:9090/metrics | grep '^deepstream_' | head
 curl -s http://edge-builder-1.local:8001/detector/metrics | grep '^deepstream_' | head  # through the proxy
 ```
 
-Detector stream rate from curl:
+Detection WebSocket rate from the shell (counts frames for 5 s):
 ```bash
-timeout 5 curl -s -N -o /tmp/sample.bin http://10.42.0.2:9090/stream
-echo "$(stat -c%s /tmp/sample.bin)b / $(grep -c '^--frame' /tmp/sample.bin) frames in 5s"
+timeout 5 websocat -n1 ws://10.42.0.2:9090/detections 2>/dev/null | wc -l
 ```
 
 GPU stats:
 ```bash
 curl -s http://10.42.0.2:9091/metrics | grep '^jetson_' | head
+```
+
+mediamtx paths (confirm relay is publishing):
+```bash
+curl -s http://10.42.0.2:9997/v3/paths/list | jq '.items[] | {name, ready, readers}'
 ```
 
 Detector logs (full history across restarts):
@@ -249,19 +310,22 @@ ssh root@10.42.0.2 'ps aux --sort=-rss | head -6'
 
 ## Common session gotchas (hard-won)
 
-- **"Detector dies silently every 1–2 minutes."** See the port plan —
-  the NVDEC + `appsink + gst_buffer_map` path has an NVMM leak that OOMs
-  the container. Workaround in current baseline: software decode via
-  `avdec_h264`. Real fix: the DeepStream pad-probe port.
+- **"Detector dies silently every 1–2 minutes."** The Stage-0 NVDEC +
+  `appsink + gst_buffer_map` path had an NVMM leak that OOMed the
+  container. Fixed as of the Stage 1 port (pad-probe on `nvtracker.src`
+  reads `NvDsBatchMeta`; no buffer mapping). If you still see it, you
+  regressed the probe path — check `Sources/CGStreamer/nvds_shim.c`.
 - **"SSH banner times out even though ping works."** The Jetson is
   CPU-starved, usually from a detector tight-restart loop. If you
   deployed with `--restart-unless-stopped` on a build that crashes
   rapidly, you'll need to power-cycle the device. Never use
   `--restart-unless-stopped` on a build whose stability you haven't
   confirmed.
-- **Stream shows black in the browser after a few seconds.** Either
-  the detector died (check metrics via proxy), or you're hitting the
-  flaky WiFi path because the proxy is down (restart `monitor_proxy.py`).
+- **Video panel shows nothing in the browser.** Either the detector
+  died (check metrics via proxy), the camera WiFi dropped (`nmcli con
+  up "badgers den"` on the Jetson), or mediamtx isn't publishing
+  (`systemctl is-active mediamtx` + `curl .../v3/paths/list`). See
+  `docs/HANDOFF.md` §9.5 for the full FPS=0 decision tree.
 - **VLM descriptions look great but detector crashes faster.** The VLM
   sidecar consumes ~2 GB unified memory; reduces detector headroom. Kill
   it with the `docker stop llama-vlm` recipe above.

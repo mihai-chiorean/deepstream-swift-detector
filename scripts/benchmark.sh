@@ -55,11 +55,11 @@ PYTHON_DIR="${REPO_ROOT}/detector"
 SWIFT_APP_NAME="detector-swift"
 # Python detector uses a distinct appId (sh.wendy.examples.deepstream-detector-python)
 # which wendy maps to the container name "deepstream-detector-python"
-PYTHON_APP_NAME="deepstream-detector-python"
+PYTHON_APP_NAME="detector"
 
 # Container image names on device (from `ctr -n default images ls`)
 SWIFT_IMAGE_NAME="detector-swift"
-PYTHON_IMAGE_NAME="deepstream-detector-python"
+PYTHON_IMAGE_NAME="detector"
 
 # SSH shorthand — StrictHostKeyChecking disabled for lab device
 SSH="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR root@${DEVICE_IP}"
@@ -1241,8 +1241,12 @@ if [[ "${CONCURRENT}" == true && "${DETECTOR}" == "both" ]]; then
         sleep 15
     fi
 
-    if [[ "${RESULT_CONCURRENT_OK}" != "false" ]]; then
+    # Only skip if deploy explicitly failed; the initial "false" value
+    # is just the unrun state — call the function unconditionally here.
+    if [[ -z "${RESULT_CONCURRENT_REASON:-}" ]]; then
         run_concurrent_benchmark
+    else
+        warn "Skipping concurrent benchmark: ${RESULT_CONCURRENT_REASON}"
     fi
 
 elif [[ "${CONCURRENT}" == true && "${DETECTOR}" != "both" ]]; then

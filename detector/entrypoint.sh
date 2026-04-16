@@ -12,9 +12,10 @@ export CUDA_VER="12.6"
 # conflict with Swift detector on 9090)
 export METRICS_PORT="${METRICS_PORT:-9092}"
 
-# Stream mux dimensions — sub-stream is 640x360
-export STREAMMUX_WIDTH="${STREAMMUX_WIDTH:-640}"
-export STREAMMUX_HEIGHT="${STREAMMUX_HEIGHT:-360}"
+# Stream mux dimensions — mediamtx relay passes through the main camera
+# stream unchanged at 1920×1080. Both detectors now run on identical input.
+export STREAMMUX_WIDTH="${STREAMMUX_WIDTH:-1920}"
+export STREAMMUX_HEIGHT="${STREAMMUX_HEIGHT:-1080}"
 
 # Clear GStreamer plugin cache to force re-scan
 rm -rf ~/.cache/gstreamer-1.0/ 2>/dev/null
