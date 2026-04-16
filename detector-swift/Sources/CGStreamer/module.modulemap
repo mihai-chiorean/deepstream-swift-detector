@@ -1,8 +1,13 @@
 module CGStreamer [system] {
     header "shim.h"
+    header "nvds_shim.h"
     link "gstreamer-1.0"
     link "gstapp-1.0"
     link "gobject-2.0"
     link "glib-2.0"
+    // DeepStream metadata libraries — present in the dustynv/l4t-deepstream
+    // container. Provides gst_buffer_get_nvds_batch_meta and related symbols.
+    link "nvdsgst_meta"
+    link "nvds_meta"
     export *
 }

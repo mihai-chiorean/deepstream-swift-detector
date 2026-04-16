@@ -143,6 +143,18 @@ actor VLMClient {
         }
     }
 
+    /// No-op stub used when the VLM crop path is disabled.
+    ///
+    /// Returns a runtime error string rather than nil so callers can log a
+    /// meaningful message instead of silently dropping the event.
+    ///
+    /// TODO: VLM path — remove this stub and call describe(...) once
+    ///       NvBufSurfaceMap-based crop extraction is implemented (plan §8 option a).
+    func describeDisabled(trackId: Int) async -> String? {
+        logger.debug("VLM temporarily disabled — skipping crop for track \(trackId)")
+        return nil
+    }
+
     /// Check whether the VLM server is reachable.
     func checkHealth() async -> Bool {
         do {

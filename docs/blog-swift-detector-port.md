@@ -1,0 +1,128 @@
+---
+title: when the unmap is impossible, the architecture is the bug
+voice: engineer-lessons
+structure: build-to-point
+audience: engineers building edge AI / computer vision pipelines on Jetson, anyone who's debugged a memory leak that turned out to be a design problem, Swift-on-Linux folks
+thesis: the NVMM leak in the Swift detector wasn't a bug to debug — it was the architecture telling us Swift had no business pulling decoded frames out of the GPU. Restructuring around in-pipeline rendering deleted ~1,800 lines of Swift, killed the leak, and ended up with a cleaner boundary than we started with.
+status: draft-v5
+---
+
+# when the unmap is impossible, the architecture is the bug
+
+I had a Swift process pulling decoded video frames out of a GStreamer pipeline on a Jetson, through `appsink` and `gst_buffer_map`, and the process leaked memory at **roughly 65 megabytes per second** — fast enough to hit OOM inside a couple of minutes without a cgroup cap saving you. (And if your cgroup cap is wrong, you can also lock up the whole Jetson hard enough to need a power-cycle. Ask me how I know.)
+
+The fix wasn't to debug the leak. The fix was to look at where the leak was and accept that the pipeline was telling me something about the design.
+
+## The setup
+
+The leaking process was the Swift edge-detection pipeline I wrote about a few weeks back — Swift 6.2 on a Jetson Orin Nano, replacing a 1,400-line Python + DeepStream stack. Originally it ran a GStreamer pipeline that terminated in an `appsink`; every frame, Swift pulled the buffer out, `gst_buffer_map`'d it, handed the bytes to a TensorRT YOLO engine, ran a Kalman tracker, drew bounding boxes on the frame, JPEG-encoded it, and served it as MJPEG to a browser. About 4,250 lines of Swift, including a hand-rolled SORT tracker and a 5×7 bitmap font renderer. (Yes, really.)
+
+This worked, at 20 FPS, on a $250 device. It also leaked.
+
+## Why it leaked
+
+DeepStream on Jetson uses something called **NVMM** — NVIDIA Multimedia Memory. The whole point is zero-copy: NVDEC writes decoded frames into a CUDA-accessible surface pool, and downstream GPU plugins (`nvinfer`, `nvtracker`, `nvvideoconvert`) read straight from that pool without any CPU round-trip. The frames never leave GPU memory. Beautiful when everything stays on the GPU.
+
+The catch is what happens when something *not* on the GPU tries to read a frame. Like a Swift process pulling bytes through `appsink`.
+
+`gst_buffer_map(READ)` on an NVMM buffer pins an `NvBufSurface` pool entry. To release the pin you have to call `NvBufSurfaceUnMap` — the DeepStream-specific unmap, not the generic GStreamer one. NVIDIA's Python DeepStream sample carries an explicit warning about this on the equivalent code path: you MUST call the unmap, failing to do so causes severe leaks (memory grows to 100%+ in minutes). In Python, the bindings expose `unmap_nvds_buf_surface()` and the sample calls it. In Swift, calling `gst_buffer_unmap` at the GStreamer layer was supposed to handle it. It didn't.
+
+I tried the obvious knobs. Different converter plugins (`nvvideoconvert`, `nvvidconv`). Property tweaks (`compute-hw=1`, `copy-hw=2`, `num-extra-surfaces=1`). Forcing an NV12 intermediate. A `queue leaky=downstream` upstream of the appsink. The leak canary on the host — `/sys/kernel/debug/nvmap/iovmm/allocations` — climbed from 65 MB to 3.1 GB in 30 seconds regardless. Every config leaked. The leak was specifically on the NVMM pool. And the Python DeepStream pipeline on the same source on the same device did not leak.
+
+The mechanism I haven't confirmed but strongly suspect: `gst_buffer_unmap` doesn't propagate into `NvBufSurfaceUnMap` for DeepStream pool buffers in a process with no CUDA context, and Swift — talking to GStreamer through pure C interop, no `cudaSetDevice` anywhere — has no CUDA context. The design signal I have confirmed: I can't add a CUDA context to Swift cheaply. Either I embed CUDA myself (heavy lift, ABI risk) or I wrap the whole thing in a C++ shim that owns the context (which defeats the point of writing it in Swift). That's the moment to stop debugging.
+
+## The thing the leak was telling me
+
+The pattern was: I had a tool (DeepStream) whose entire design assumes everything stays on the GPU, and I was using it as a frame source for a process that wasn't on the GPU. The leak wasn't a bug. It was the architecture refusing the pattern.
+
+Once you see it that way, the question stops being "how do I unmap correctly" and starts being "why is Swift touching NVMM at all?" What does Swift actually need from the pipeline?
+
+Two things, it turns out. **Detections** — class, bounding box, tracker ID — to feed into the rest of the application logic (HTTP endpoints, the VLM sidecar, Prometheus metrics). And, when the user is watching a stream, **a JPEG to put on a web page**. That's it. Swift doesn't need pixels. Swift needs *metadata* and the *occasional rendered JPEG*.
+
+Both of those have shapes that don't require pulling NVMM out of the pipeline.
+
+DeepStream attaches detection results to GstBuffers as `NvDsBatchMeta` — flat C structs hanging off the buffer. You can read them in a pad probe without ever calling `gst_buffer_map`. That's how the Python detector reads detections; I just hadn't gone that far in the Swift version because I was still pulling raw frames anyway.
+
+And `nvjpegenc` does the JPEG encode entirely on the GPU, then emits a system-memory buffer (~20 KB per frame). Mapping a system-memory buffer is free — that's just a malloc'd page, no NVMM pool entry to pin.
+
+From there the redesign is straightforward, even if the implementation isn't. Tee the decoded NVMM stream into two branches. One goes through `nvinfer` + `nvtracker` + `fakesink`, and a pad probe pulls the detection metadata. The other goes through `nvdsosd` (which draws the bounding boxes from that same metadata, in-pipeline, on the GPU) and then `nvjpegenc` and `appsink`. Swift never sees an NVMM buffer.
+
+## The pipeline that fell out
+
+```text
+rtspsrc location=$URL latency=200 protocols=tcp
+  ! rtph264depay ! h264parse
+  ! nvv4l2decoder
+  ! m.sink_0 nvstreammux name=m batch-size=1 width=1920 height=1080
+  ! nvinfer config-file-path=/app/nvinfer_config.txt
+  ! nvtracker name=wendy_tracker
+      ll-config-file=/app/tracker_config.yml
+      ll-lib-file=/opt/nvidia/deepstream/deepstream-7.1/lib/libnvds_nvmultiobjecttracker.so
+  ! tee name=t
+  t. ! queue ! fakesink
+  t. ! queue max-size-buffers=2 leaky=downstream
+     ! nvvideoconvert ! nvdsosd ! nvvideoconvert
+     ! nvjpegenc quality=85
+     ! appsink name=mjpeg_sink emit-signals=false sync=false max-buffers=1 drop=true
+```
+
+Two non-obvious choices in there, both of which protect the new boundary.
+
+The tee is **after** `nvtracker`, not before, so both branches carry the `NvDsBatchMeta`. That's what lets `nvdsosd` draw boxes on the MJPEG branch from the same metadata the pad probe sees — Swift never hand-renders anything.
+
+There's only one `rtspsrc`. The camera enforces a single RTSP session, which I discovered when an earlier design (separate sidecar pulling its own RTSP for the MJPEG path) got disconnected on every connect. One source, decode once, tee.
+
+The MJPEG branch always runs, but with `appsink max-buffers=1 drop=true` and a leaky queue in front of `nvjpegenc`, when nothing's connected to `/stream` the pipeline just drops frames at the appsink. One static pipeline, no conditional construction. A live frame from the MJPEG endpoint:
+
+![Detection frame served by the in-pipeline nvdsosd + nvjpegenc path](sample-detection-frame.jpg)
+
+## What disappeared
+
+The accounting on the Swift side is the part I keep coming back to.
+
+- `DetectorEngine.swift` — TensorRT engine wrapper, ~360 lines. Gone. `nvinfer` does this in-pipeline.
+- `YOLOPreprocessor.swift` — letterbox + normalize + HWC→CHW, ~190 lines. Gone. `nvinfer` config does this.
+- `YOLOPostprocessor.swift` — confidence filter and coordinate decode, ~145 lines. Gone, replaced by a ~120-line C bbox parser plugin that DeepStream loads at runtime.
+- `Tracker.swift` + `KalmanFilter2D.swift` — SORT tracker, ~700 lines. Gone. `nvtracker` runs NvDCF, which is a better tracker than the one I wrote.
+- `FrameRenderer.swift` — bbox drawing, the 5×7 bitmap font, JPEG encode, ~570 lines. Mostly gone — `nvdsosd` draws boxes, `nvjpegenc` encodes.
+
+Net: about 1,800 lines of Swift removed. What replaces it is ~150 lines of GStreamer glue in `GStreamerFrameReader.swift` plus ~130 lines of C shim that walks the `NvDsBatchMeta` linked lists and flattens the detections into a struct array Swift can consume:
+
+```c
+for (NvDsMetaList *fl = bm->frame_meta_list; fl && count < maxOut; fl = fl->next) {
+    NvDsFrameMeta *fm = (NvDsFrameMeta *)fl->data;
+    for (NvDsMetaList *ol = fm->obj_meta_list; ol && count < maxOut; ol = ol->next) {
+        NvDsObjectMeta *om = (NvDsObjectMeta *)ol->data;
+        out[count].classId    = om->class_id;
+        out[count].confidence = om->confidence;
+        out[count].left       = om->rect_params.left;
+        // ...
+        count++;
+    }
+}
+```
+
+That's the whole boundary. Swift code touches zero NVMM. Detection data crosses as a flat C struct. The pad probe runs on the GStreamer streaming thread and yields into an `AsyncStream<DetectionFrame>` that the rest of the app consumes like any other Swift async sequence.
+
+Same FPS as before — 20 on the same 1080p RTSP source. The leak canary on `/sys/kernel/debug/nvmap/iovmm/allocations` is flat after warmup, where the old version had it climbing 65 MB → 3.1 GB in 30 seconds. RSS plateaus well under the 5 GiB cgroup cap and stays there across multi-hour soak runs, vs. the old behavior of OOM in single-digit minutes. Less code, no leak.
+
+## The slog (because it was real)
+
+The redesign reads like it fell out cleanly and it didn't. The common thread is *cross-compiling for an embedded NVIDIA stack on an x86 host* — every layer (the Swift SDK, the aarch64 sysroot, the DeepStream headers, the container builder) has its own way of being almost-but-not-quite right. A few flavors:
+
+- WendyOS ships a Swift cross-compile SDK for aarch64. The SDK was missing DeepStream headers and linker stubs. Fixed via a Yocto bbappend that packages them into the `-dev` part of the deepstream recipe and rebuilds the SDK image from source.
+- 12-minute qemu-emulated `apt-get` cycles for `libcairo2` and friends, which turned into a manual hunt through `~/jetson/Linux_for_Tegra/rootfs/` to `COPY` the aarch64 `.so` files in directly.
+- BuildKit cache shipping a stale binary at one point. An hour to track down.
+- The build daemon getting stuck and needing a restart partway through.
+
+None of that argues against the architectural lesson — if anything it sharpens it. On a stack like this, the time you save by getting the boundary right is the only thing that gives you back the time the platform takes from you. The lesson was the cheap part of the work. The slog was the rest of it.
+
+## What I want to remember from this
+
+**When the fix for a resource leak is this ugly, the architecture is telling you something.** I spent two days trying to get the unmap to propagate. The clue was sitting in front of me by hour two: *every* configuration leaked — not "this one config leaks because I forgot a flag" but "the entire class of configurations leaks." That's a design signal, not a bug. I just didn't take it seriously enough early enough.
+
+**The cleanest version of this code is the one where Swift doesn't try to do NVIDIA's job.** I had been treating DeepStream as a frame source. It's not. It's a graph that runs on the GPU and produces metadata. The "useful" output isn't pixels, it's structured detections. Once Swift accepts that the pipeline owns rendering too — via `nvdsosd` and `nvjpegenc`, which are sitting right there waiting to be used — the boundary becomes obvious and small.
+
+**Less code is the byproduct of a better fit, not the goal.** I didn't set out to delete 1,800 lines; I set out to stop the leak. The Kalman filter, the bitmap font, the letterbox — those were all me reimplementing pieces of DeepStream in Swift, and they all became unnecessary the moment Swift stopped being the renderer.
+
+The right boundary in a system like this lives wherever the data actually wants to flow. When you find yourself fighting the framework to drag data across the wrong line, the leak is the framework telling you so.

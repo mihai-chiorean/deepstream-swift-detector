@@ -64,9 +64,32 @@ struct Detection: Sendable {
     var frameNum: Int
 }
 
+// MARK: - FrameTiming
+
+/// Per-frame component latency values extracted from DeepStream's
+/// NVDS_LATENCY_MEASUREMENT_META batch user-metas.
+///
+/// Requires NVDS_ENABLE_COMPONENT_LATENCY_MEASUREMENT=1 in the environment.
+/// All fields are 0 when the env var is not set or the component didn't emit
+/// a meta for the frame.
+///
+/// Bucket mapping (see nvds_shim.c for exact component name matching):
+///   decodeMs      — nvv4l2decoder
+///   preprocessMs  — nvstreammux + nvinfer (batching + DNN forward pass)
+///   postprocessMs — nvtracker (track management; bbox-parser runs inside nvinfer
+///                   but DS doesn't break it out as a separate meta component)
+struct FrameTiming: Sendable {
+    /// nvv4l2decoder latency in milliseconds; 0 if unavailable.
+    var decodeMs: Double
+    /// nvstreammux + nvinfer accumulated latency in milliseconds; 0 if unavailable.
+    var preprocessMs: Double
+    /// nvtracker latency in milliseconds; 0 if unavailable.
+    var postprocessMs: Double
+}
+
 // MARK: - DetectionStream
 
-/// Bridges the C pad-probe callback to an AsyncStream<[Detection]>.
+/// Bridges the C pad-probe callback to an AsyncStream<DetectionFrame>.
 ///
 /// The instance is heap-allocated and retained for the lifetime of the
 /// GStreamer pipeline via `Unmanaged.passRetained`. Calling `finish()` ends
@@ -75,21 +98,36 @@ struct Detection: Sendable {
 /// Swift 6 note: `continuation` is Sendable; `ingest` can be called safely
 /// from the GStreamer streaming thread without actor hops. The class is
 /// marked @unchecked Sendable to cross the isolation boundary.
+/// One frame's output: the detection list plus the frame's end-to-end
+/// pipeline latency (now − buffer.PTS, in nanoseconds). Computed in the C
+/// probe using `gst_element_get_current_running_time` on the tracker element.
+struct DetectionFrame: Sendable {
+    let detections: [Detection]
+    let frameLatencyNs: UInt64
+    /// Per-component latency from DS NVDS_LATENCY_MEASUREMENT_META metas.
+    /// All fields are 0 when NVDS_ENABLE_COMPONENT_LATENCY_MEASUREMENT is not set.
+    let timing: FrameTiming
+}
+
 final class DetectionStream: @unchecked Sendable {
 
-    private let continuation: AsyncStream<[Detection]>.Continuation
-    let stream: AsyncStream<[Detection]>
+    private let continuation: AsyncStream<DetectionFrame>.Continuation
+    let stream: AsyncStream<DetectionFrame>
 
     init() {
-        var cap: AsyncStream<[Detection]>.Continuation!
+        var cap: AsyncStream<DetectionFrame>.Continuation!
         self.stream = AsyncStream(bufferingPolicy: .bufferingNewest(4)) { cap = $0 }
         self.continuation = cap
     }
 
     /// Called from the C probe callback on the GStreamer streaming thread.
     /// Safe to call from any thread — AsyncStream.Continuation is Sendable.
-    func ingest(_ detections: [Detection]) {
-        continuation.yield(detections)
+    func ingest(_ detections: [Detection], frameLatencyNs: UInt64, timing: FrameTiming) {
+        continuation.yield(DetectionFrame(
+            detections: detections,
+            frameLatencyNs: frameLatencyNs,
+            timing: timing
+        ))
     }
 
     /// Finish the stream (called on pipeline teardown).
@@ -122,6 +160,8 @@ struct GstElementRef: @unchecked Sendable {
 func wendyDetectionProbeEntry(
     count: Int32,
     dets: UnsafePointer<WendyDetection>?,
+    frameLatencyNs: UInt64,
+    cTiming: WendyFrameTiming,
     userData: UnsafeMutableRawPointer?
 ) {
     guard let userData else { return }
@@ -149,13 +189,19 @@ func wendyDetectionProbeEntry(
         }
     }
 
-    ds.ingest(copy)
+    let timing = FrameTiming(
+        decodeMs: cTiming.decode_ms,
+        preprocessMs: cTiming.preprocess_ms,
+        postprocessMs: cTiming.postprocess_ms
+    )
+
+    ds.ingest(copy, frameLatencyNs: frameLatencyNs, timing: timing)
 }
 
 // MARK: - GStreamerFrameReader
 
 /// Actor that owns a DeepStream GStreamer pipeline and exposes detections as
-/// an `AsyncStream<[Detection]>`.
+/// an `AsyncStream<DetectionFrame>`.
 ///
 /// The pipeline includes a tee that feeds both the detection branch (nvinfer +
 /// nvtracker + fakesink) and the MJPEG branch (nvjpegenc + appsink). Both
@@ -206,7 +252,7 @@ actor GStreamerFrameReader {
     /// Returns a tuple of the detection AsyncStream and an optional GstElementRef
     /// for the MJPEG branch appsink. The ref is valid for the lifetime of the
     /// pipeline; the caller MUST NOT release the underlying element.
-    func start() throws -> (detections: AsyncStream<[Detection]>, mjpegSink: GstElementRef?) {
+    func start() throws -> (detections: AsyncStream<DetectionFrame>, mjpegSink: GstElementRef?) {
         guard !isRunning else {
             guard let ds = detectionStream else {
                 throw GStreamerError.notStarted
@@ -267,8 +313,14 @@ actor GStreamerFrameReader {
         let id = wendy_install_detection_probe(
             tracker,
             "src",
-            { count, dets, userData in
-                wendyDetectionProbeEntry(count: count, dets: dets, userData: userData)
+            { count, dets, frameLatencyNs, cTiming, userData in
+                wendyDetectionProbeEntry(
+                    count: count,
+                    dets: dets,
+                    frameLatencyNs: frameLatencyNs,
+                    cTiming: cTiming,
+                    userData: userData
+                )
             },
             box
         )
@@ -405,7 +457,7 @@ actor GStreamerFrameReader {
 
 // MARK: - GStreamerReader (Sendable wrapper)
 
-/// `Sendable` wrapper that exposes detections as an `AsyncStream<[Detection]>`
+/// `Sendable` wrapper that exposes detections as an `AsyncStream<DetectionFrame>`
 /// and provides the MJPEG appsink element for the sidecar pull loop.
 struct GStreamerReader: Sendable {
     private let reader: GStreamerFrameReader
@@ -418,7 +470,7 @@ struct GStreamerReader: Sendable {
     ///
     /// The MJPEG sink element is valid for the lifetime of the pipeline.
     /// It is owned by the GStreamerFrameReader; callers must not release it.
-    func start() async throws -> (detections: AsyncStream<[Detection]>, mjpegSink: GstElementRef?) {
+    func start() async throws -> (detections: AsyncStream<DetectionFrame>, mjpegSink: GstElementRef?) {
         try await reader.start()
     }
 
