@@ -356,6 +356,7 @@ actor GStreamerFrameReader {
         ! nvv4l2decoder \
         ! m.sink_0 nvstreammux name=m batch-size=1 width=1920 height=1080 \
         ! nvinfer config-file-path=/app/nvinfer_config.txt \
+            filter-out-class-ids=4;6;8;9;10;11;12;13;20;21;22;23;24;25;26;27;28;29;30;31;32;33;34;35;36;37;38;39;40;41;42;43;44;45;46;47;48;49;50;51;52;53;54;55;56;57;58;59;60;61;62;63;64;65;66;67;68;69;70;71;72;73;74;75;76;77;78;79 \
         ! nvtracker name=wendy_tracker \
             ll-config-file=/app/tracker_config.yml \
             ll-lib-file=/opt/nvidia/deepstream/deepstream-7.1/lib/libnvds_nvmultiobjecttracker.so \
