@@ -45,6 +45,6 @@ parse-bbox-func-name=NvDsInferParseYolo26
 force-implicit-batch-dim=0
 
 [class-attrs-all]
-pre-cluster-threshold=0.4
+pre-cluster-threshold=0.45
 # post-cluster kept at default since cluster-mode=4 is no-op; our parser does the confidence filter.
 topk=300
