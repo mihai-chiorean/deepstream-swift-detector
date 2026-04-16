@@ -46,5 +46,5 @@ parse-bbox-func-name=NvDsInferParseYolo26
 [class-attrs-all]
 nms-iou-threshold=0.45
 # Raised from 0.25 to 0.4 to reduce false positives (e.g. motorcycle→airplane)
-pre-cluster-threshold=0.4
+pre-cluster-threshold=0.45
 topk=300
