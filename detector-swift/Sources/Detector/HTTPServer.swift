@@ -4,19 +4,31 @@
 // Exposes:
 //   GET /metrics               - Prometheus text format metrics
 //   GET /health                - JSON health status
-//   GET /stream                - MJPEG multipart/x-mixed-replace live video
+//   GET /stream                - 301 redirect to /webrtc/relayed/whep (WHEP endpoint)
+//   GET /detections            - WebSocket: per-frame detection JSON stream
 //   GET /api/vlm_descriptions  - Recent VLM descriptions
-//   GET /api/vlm_status        - VLM service status
+//   GET /api/vlm_status        - VLM service availability
 //
-// /stream: served by MJPEGSidecar. The sidecar pipeline (rtspsrc →
-// nvv4l2decoder → nvvideoconvert → videorate → nvjpegenc → appsink) starts
-// on the first client connection and stops when the last disconnects.
-// gst_buffer_map is called only on system-memory JPEG buffers output by
-// nvjpegenc — no NVMM pinning, no leak.
+// Stage 2: The /stream MJPEG endpoint is replaced by a 301 redirect to
+// /webrtc/relayed/whep (the mediamtx WHEP endpoint via monitor_proxy).
+// The MJPEGSidecar and valve wiring are gone. Video is delivered by mediamtx
+// via WebRTC; the detector only publishes detections.
+//
+// /detections: WebSocket endpoint. Each connected browser tab receives a JSON
+// message per detection frame:
+//   { frameNum, ptsNs, timestampMs, detections: [{classId, confidence, x, y, w, h, trackId}] }
+// The DetectionBroadcaster actor fans out from the single DetectionStream to N
+// clients; a slow client drops stale frames (bufferingNewest(4) per client).
 //
 // Port: 9090 (matching Python detector default)
+//
+// WebSocket setup: HummingbirdWebSocket requires a BasicWebSocketRequestContext
+// (superset of BasicRequestContext) and an Application configured with
+// HTTPServerBuilder.http1WebSocketUpgrade(webSocketRouter:). Both HTTP and WS
+// routes are registered on the same BasicWebSocketRequestContext router.
 
 import Hummingbird
+import HummingbirdWebSocket
 import Logging
 import NIOCore
 
@@ -31,26 +43,13 @@ import NIOCore
 /// Shared mutable state that the HTTP server reads from the detection pipeline.
 actor DetectorState: Sendable {
 
-    // MARK: MJPEG sidecar
+    // MARK: Detection broadcaster
 
-    private(set) var mjpegSidecar: MJPEGSidecar?
+    private(set) var detectionBroadcaster: DetectionBroadcaster?
 
-    func setMJPEGSidecar(_ sidecar: MJPEGSidecar) {
-        self.mjpegSidecar = sidecar
+    func setDetectionBroadcaster(_ broadcaster: DetectionBroadcaster) {
+        self.detectionBroadcaster = broadcaster
     }
-
-    // MARK: Legacy frame store (retained for forward compatibility)
-
-    private(set) var latestJPEGFrame: [UInt8]?
-    private(set) var mjpegClientCount: Int = 0
-
-    var shouldExtractFrames: Bool { mjpegClientCount > 0 }
-
-    func setFrame(_ jpeg: [UInt8]) {
-        latestJPEGFrame = jpeg
-    }
-
-    func getFrame() -> [UInt8]? { latestJPEGFrame }
 }
 
 // MARK: - AllOriginsMiddleware
@@ -75,9 +74,9 @@ func buildRouter(
     state: DetectorState,
     metrics: MetricsRegistry,
     vlmClient: VLMClient
-) -> Router<BasicRequestContext> {
+) -> Router<BasicWebSocketRequestContext> {
 
-    let router = Router(context: BasicRequestContext.self)
+    let router = Router(context: BasicWebSocketRequestContext.self)
     router.middlewares.add(AllOriginsMiddleware())
 
     // ------------------------------------------------------------------
@@ -110,74 +109,88 @@ func buildRouter(
     }
 
     // ------------------------------------------------------------------
-    // GET /stream  - MJPEG multipart/x-mixed-replace video stream
+    // GET /stream  - 301 redirect to WHEP WebRTC endpoint
     //
-    // Each HTTP request opens a persistent streaming connection. The
-    // MJPEGSidecar pipeline starts on the first connection and stops
-    // when the last client disconnects.
-    //
-    // Frame format (RFC 2046 multipart):
-    //   --mjpegframe\r\n
-    //   Content-Type: image/jpeg\r\n
-    //   Content-Length: <N>\r\n
-    //   \r\n
-    //   <JPEG bytes>
-    //   \r\n
+    // Stage 2: MJPEG is gone. Anything still hitting /stream is redirected
+    // to the mediamtx WHEP endpoint via monitor_proxy. RTCPeerConnection
+    // clients should POST directly to /webrtc/relayed/whep.
     // ------------------------------------------------------------------
     router.get("stream") { _, _ -> Response in
-        guard let sidecar = await state.mjpegSidecar else {
-            let json = "{\"error\":\"MJPEG sidecar not initialised\",\"status\":503}"
-            var headers = HTTPFields()
-            headers[.contentType] = "application/json"
-            return Response(
-                status: .serviceUnavailable,
-                headers: headers,
-                body: ResponseBody(byteBuffer: ByteBuffer(string: json))
-            )
+        var headers = HTTPFields()
+        headers[.location] = "/webrtc/relayed/whep"
+        return Response(
+            status: .movedPermanently,
+            headers: headers,
+            body: ResponseBody(byteBuffer: ByteBuffer(string: ""))
+        )
+    }
+
+    // ------------------------------------------------------------------
+    // GET /detections  - WebSocket: per-frame detection JSON stream
+    //
+    // Each connected browser tab receives one JSON message per detection
+    // frame. The DetectionBroadcaster fans out from the single shared
+    // DetectionStream; slow clients drop stale frames rather than blocking
+    // the detector.
+    //
+    // Message schema:
+    //   {
+    //     "frameNum": 42,
+    //     "ptsNs": 1234567890,
+    //     "timestampMs": 1713301234567,
+    //     "detections": [
+    //       {"classId":2,"confidence":0.87,"x":100,"y":200,
+    //        "w":150,"h":80,"trackId":3}
+    //     ]
+    //   }
+    //
+    // ptsNs is -1 when no GStreamer PTS is available (GST_CLOCK_TIME_NONE).
+    //
+    // Handler pattern:
+    //   - defer { unsubscribe } ensures cleanup on TCP drop / tab close.
+    //   - Inbound is drained in a child task so the WebSocket channel stays
+    //     healthy (pings, close frames). Outbound sends detection JSON.
+    //   - Write errors (TCP drop) are caught and break the loop cleanly.
+    // ------------------------------------------------------------------
+    router.ws("detections") { inbound, outbound, _ in
+        guard let broadcaster = await state.detectionBroadcaster else {
+            return
         }
 
-        let (clientID, frameStream) = await sidecar.subscribeFrames()
+        let (clientID, messageStream) = await broadcaster.subscribe()
 
-        var headers = HTTPFields()
-        headers[.contentType] = "multipart/x-mixed-replace; boundary=mjpegframe"
-        headers[.cacheControl] = "no-cache, no-store, must-revalidate"
+        // withTaskGroup runs inbound drain + outbound send concurrently.
+        // The group exits when BOTH tasks complete. We cancel the group
+        // (by throwing) when the outbound loop finishes so the drain task
+        // also exits.
+        await withTaskGroup(of: Void.self) { group in
+            // Task 1: drain inbound frames (pings / browser → server messages).
+            // The WebSocket framework handles pings/pongs internally inside next().
+            // We drain here to ensure close frames are processed and the connection
+            // is properly acknowledged. We don't use client-sent data.
+            group.addTask {
+                do { for try await _ in inbound {} } catch {}
+            }
 
-        let body = ResponseBody { writer in
-            // Stream JPEG frames until the client disconnects or the sidecar ends.
-            // When writing throws (client disconnected), we break out, unsubscribe,
-            // and call finish so Hummingbird closes the connection cleanly.
-            var writeError: (any Error)?
-            for await jpeg in frameStream {
-                var part = ByteBuffer()
-                part.writeString("--mjpegframe\r\n")
-                part.writeString("Content-Type: image/jpeg\r\n")
-                part.writeString("Content-Length: \(jpeg.count)\r\n")
-                part.writeString("\r\n")
-                part.writeBytes(jpeg)
-                part.writeString("\r\n")
+            // Task 2: send detection JSON to the client.
+            group.addTask {
                 do {
-                    try await writer.write(part)
+                    for await message in messageStream {
+                        try await outbound.write(.text(message))
+                    }
                 } catch {
-                    // Client disconnected — normal, not an error to propagate.
-                    writeError = error
-                    break
+                    // TCP drop or client close — normal. Break out of loop.
                 }
             }
 
-            // Unsubscribe regardless of how the loop exited.
-            await sidecar.unsubscribe(id: clientID)
-
-            // Close the response body. If the client already disconnected,
-            // this will throw — that's fine, Hummingbird handles it.
-            if writeError == nil {
-                try await writer.finish(nil)
-            } else {
-                // Swallow the finish error — client is gone.
-                try? await writer.finish(nil)
-            }
+            // Wait for either task to finish (client disconnect or stream end),
+            // then cancel the other task.
+            await group.next()
+            group.cancelAll()
         }
 
-        return Response(status: .ok, headers: headers, body: body)
+        // Always unsubscribe after the handler exits, regardless of how we got here.
+        await broadcaster.unsubscribe(id: clientID)
     }
 
     // ------------------------------------------------------------------
@@ -239,8 +252,11 @@ func startHTTPServer(
 
     let router = buildRouter(state: state, metrics: metrics, vlmClient: vlmClient)
 
+    // Use http1WebSocketUpgrade so the same router handles both HTTP routes
+    // and WebSocket upgrade requests matched by path (/detections).
     let app = Application(
         router: router,
+        server: .http1WebSocketUpgrade(webSocketRouter: router),
         configuration: .init(
             address: .hostname("0.0.0.0", port: port)
         ),
@@ -248,7 +264,7 @@ func startHTTPServer(
     )
 
     logger.info(
-        "HTTP server listening",
+        "HTTP server listening (with WebSocket /detections)",
         metadata: ["address": "0.0.0.0:\(port)"]
     )
 

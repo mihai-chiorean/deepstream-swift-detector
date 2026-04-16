@@ -1,6 +1,10 @@
 # Port Plan: Swift detector → DeepStream-native pipeline
 
-Status: **stable software-decode baseline running. Port is next milestone.**
+**STATUS: COMPLETE as of commit `415cc8c` (2026-04-15).** The Swift detector now runs the DeepStream-native pipeline described in this plan: `nvv4l2decoder → nvstreammux → nvinfer → nvtracker → fakesink` with a pad probe on `nvtracker.src` reading `NvDsBatchMeta`. Hardware NVDEC is live. The NVMM leak described below is resolved. Stage 2 (MJPEG branch removal + mediamtx WebRTC for video) landed the same day. For current runtime state, measurements, and deploy recipes, see `docs/HANDOFF.md`. The body of this document is preserved as the historical design record and the authoritative root-cause analysis for the NVMM leak that motivated the port — do not paraphrase, it's still the best "why does this design exist" doc.
+
+---
+
+Status (historical, pre-port): **stable software-decode baseline running. Port is next milestone.**
 Designed so a fresh session can pick this up without needing to re-run the
 research that produced it.
 

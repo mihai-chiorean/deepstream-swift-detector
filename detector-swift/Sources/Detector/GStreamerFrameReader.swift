@@ -1,27 +1,16 @@
 // GStreamerFrameReader.swift
 // DeepStream-native RTSP detection pipeline using nvinfer + nvtracker.
 //
-// Pipeline (single rtspsrc, tee-split):
-//   rtspsrc → rtph264depay → h264parse
-//     → nvv4l2decoder
-//     → tee name=t
-//       t. → queue ! nvstreammux ! nvinfer ! nvtracker ! fakesink   (detection)
-//       t. → queue max-size-buffers=2 leaky=downstream              (MJPEG sidecar)
-//             ! nvvideoconvert ! nvjpegenc quality=85
-//             ! appsink name=mjpeg_sink emit-signals=false sync=false
-//                        max-buffers=1 drop=true
+// Pipeline (pure detection, no MJPEG branch):
+//   rtspsrc → rtph264depay → h264parse → nvv4l2decoder
+//     → nvstreammux → nvinfer → nvtracker → fakesink
+//
+// Stage 2: The tee, valve, videodrop, nvvideoconvert, nvdsosd, nvjpegenc, and
+// appsink elements are gone. Video is served by mediamtx via WebRTC; the detector
+// only emits detection metadata.
 //
 // Detection branch: pad probe on nvtracker src pad. No gst_buffer_map —
 // no NVMM pinning, no memory leak.
-//
-// MJPEG branch: nvjpegenc produces system-memory JPEG buffers (~20 KB).
-// gst_buffer_map on system-memory buffers is cheap (malloc pages, not
-// NVMM pool). The branch always runs but the appsink drops frames when
-// no client is pulling — effectively idle when /stream has no viewers.
-//
-// Single rtspsrc: avoids the camera's 1-connection limit. The tee splits
-// the decoded NVMM stream after nvv4l2decoder so both branches share one
-// RTSP/H.264 decode path.
 //
 // Concurrency contract:
 //   The GStreamer streaming thread calls the @convention(c) probe callback.
@@ -75,16 +64,28 @@ struct Detection: Sendable {
 ///
 /// Bucket mapping (see nvds_shim.c for exact component name matching):
 ///   decodeMs      — nvv4l2decoder
-///   preprocessMs  — nvstreammux + nvinfer (batching + DNN forward pass)
+///   streammuxMs   — nvstreammux only (buffer batching + pad synchronisation)
+///   inferenceMs   — nvinfer only (letterbox resize + YOLO26n forward pass)
+///   preprocessMs  — nvstreammux + nvinfer sum (= streammuxMs + inferenceMs);
+///                   kept for backwards compatibility
 ///   postprocessMs — nvtracker (track management; bbox-parser runs inside nvinfer
 ///                   but DS doesn't break it out as a separate meta component)
+///   ptsNs         — GStreamer buffer PTS in nanoseconds; -1 if no PTS available
+///                   (GST_CLOCK_TIME_NONE). Used for frame-accurate sync.
 struct FrameTiming: Sendable {
     /// nvv4l2decoder latency in milliseconds; 0 if unavailable.
     var decodeMs: Double
+    /// nvstreammux latency in milliseconds (buffer batching only); 0 if unavailable.
+    var streammuxMs: Double
+    /// nvinfer latency in milliseconds (letterbox + DNN forward pass); 0 if unavailable.
+    var inferenceMs: Double
     /// nvstreammux + nvinfer accumulated latency in milliseconds; 0 if unavailable.
+    /// Equals streammuxMs + inferenceMs. Kept for backwards-compat (monitor.html).
     var preprocessMs: Double
     /// nvtracker latency in milliseconds; 0 if unavailable.
     var postprocessMs: Double
+    /// Buffer PTS in nanoseconds (from GST_BUFFER_PTS). -1 if not available.
+    var ptsNs: Int64
 }
 
 // MARK: - DetectionStream
@@ -106,6 +107,7 @@ struct DetectionFrame: Sendable {
     let frameLatencyNs: UInt64
     /// Per-component latency from DS NVDS_LATENCY_MEASUREMENT_META metas.
     /// All fields are 0 when NVDS_ENABLE_COMPONENT_LATENCY_MEASUREMENT is not set.
+    /// timing.ptsNs is -1 when the buffer carries no PTS.
     let timing: FrameTiming
 }
 
@@ -134,19 +136,6 @@ final class DetectionStream: @unchecked Sendable {
     func finish() {
         continuation.finish()
     }
-}
-
-// MARK: - GstElementRef
-
-/// @unchecked Sendable wrapper for a GstElement* returned from the pipeline.
-///
-/// Safety: the pointee is a GStreamer ref-counted C object owned by the pipeline
-/// (GStreamerFrameReader holds a gst_object_ref'd copy). The pointer is valid
-/// for the lifetime of the pipeline and is released in GStreamerFrameReader.cleanup().
-/// Callers MUST NOT call gst_object_unref on the pointer they receive — it is owned
-/// by GStreamerFrameReader.
-struct GstElementRef: @unchecked Sendable {
-    let element: UnsafeMutablePointer<GstElement>
 }
 
 // MARK: - @convention(c) probe entry point
@@ -191,8 +180,11 @@ func wendyDetectionProbeEntry(
 
     let timing = FrameTiming(
         decodeMs: cTiming.decode_ms,
+        streammuxMs: cTiming.streammux_ms,
+        inferenceMs: cTiming.inference_ms,
         preprocessMs: cTiming.preprocess_ms,
-        postprocessMs: cTiming.postprocess_ms
+        postprocessMs: cTiming.postprocess_ms,
+        ptsNs: cTiming.ptsNs
     )
 
     ds.ingest(copy, frameLatencyNs: frameLatencyNs, timing: timing)
@@ -203,10 +195,10 @@ func wendyDetectionProbeEntry(
 /// Actor that owns a DeepStream GStreamer pipeline and exposes detections as
 /// an `AsyncStream<DetectionFrame>`.
 ///
-/// The pipeline includes a tee that feeds both the detection branch (nvinfer +
-/// nvtracker + fakesink) and the MJPEG branch (nvjpegenc + appsink). Both
-/// branches share a single rtspsrc/nvv4l2decoder, avoiding the camera's
-/// one-connection limit.
+/// Stage 2: pure detection pipeline only — no tee, no MJPEG branch.
+/// Video is delivered by mediamtx via WebRTC. The detector pipeline is:
+///   rtspsrc → rtph264depay → h264parse → nvv4l2decoder
+///     → nvstreammux → nvinfer → nvtracker → fakesink
 actor GStreamerFrameReader {
 
     // MARK: Configuration
@@ -220,9 +212,6 @@ actor GStreamerFrameReader {
 
     /// `GstElement *` for the nvtracker element (probe target).
     private var nvtrackerElement: UnsafeMutablePointer<GstElement>?
-
-    /// `GstElement *` for the MJPEG appsink.
-    private var mjpegSinkElement: UnsafeMutablePointer<GstElement>?
 
     /// The live DetectionStream instance feeding the AsyncStream.
     private var detectionStream: DetectionStream?
@@ -246,19 +235,17 @@ actor GStreamerFrameReader {
 
     // MARK: Lifecycle
 
-    /// Initialise GStreamer, parse the DeepStream pipeline (with tee + MJPEG
-    /// branch), install the pad probe, and transition to PLAYING.
+    /// Initialise GStreamer, parse the DeepStream pipeline, install the pad
+    /// probe, and transition to PLAYING.
     ///
-    /// Returns a tuple of the detection AsyncStream and an optional GstElementRef
-    /// for the MJPEG branch appsink. The ref is valid for the lifetime of the
-    /// pipeline; the caller MUST NOT release the underlying element.
-    func start() throws -> (detections: AsyncStream<DetectionFrame>, mjpegSink: GstElementRef?) {
+    /// Returns the detection AsyncStream. No MJPEG sink or valve — Stage 2
+    /// removed the MJPEG branch entirely.
+    func start() throws -> AsyncStream<DetectionFrame> {
         guard !isRunning else {
             guard let ds = detectionStream else {
                 throw GStreamerError.notStarted
             }
-            let sinkRef = mjpegSinkElement.map { GstElementRef(element: $0) }
-            return (ds.stream, sinkRef)
+            return ds.stream
         }
 
         setupPluginEnvironment()
@@ -293,17 +280,6 @@ actor GStreamerFrameReader {
         }
         self.nvtrackerElement = tracker
 
-        // Find the MJPEG appsink (optional — log if not found but don't fail).
-        // gst_bin_get_by_name returns a ref-counted element; we store it and
-        // release it in cleanup(). The caller receives the raw pointer via
-        // GstElementRef and MUST NOT release it — it's owned by GStreamerFrameReader.
-        if let sink = gst_bin_get_by_name(bin, "mjpeg_sink") {
-            self.mjpegSinkElement = sink
-            logger.info("MJPEG appsink element found in pipeline")
-        } else {
-            logger.warning("MJPEG appsink element 'mjpeg_sink' not found — /stream will be unavailable")
-        }
-
         // Create the DetectionStream and retain it for the lifetime of the probe.
         let ds = DetectionStream()
         self.detectionStream = ds
@@ -337,13 +313,11 @@ actor GStreamerFrameReader {
         }
 
         isRunning = true
-        logger.info("DeepStream pipeline started", metadata: [
+        logger.info("DeepStream pipeline started (pure detection, no MJPEG branch)", metadata: [
             "stream": "\(stream.name)",
-            "mjpegBranch": "\(mjpegSinkElement != nil ? "enabled" : "disabled")",
         ])
 
-        let sinkRef = mjpegSinkElement.map { GstElementRef(element: $0) }
-        return (ds.stream, sinkRef)
+        return ds.stream
     }
 
     /// Transition the pipeline to NULL and release all GStreamer resources.
@@ -366,24 +340,16 @@ actor GStreamerFrameReader {
 
     // MARK: Private
 
+    /// Build the GStreamer pipeline description string.
+    ///
+    /// Stage 2: pure detection pipeline only. No tee, no MJPEG branch.
+    /// Video is served by mediamtx via WebRTC; the detector only publishes
+    /// detection metadata via the /detections WebSocket.
+    ///
+    ///   rtspsrc → rtph264depay → h264parse → nvv4l2decoder
+    ///     → nvstreammux → nvinfer → nvtracker → fakesink
     private func buildPipelineString() -> String {
         let url = stream.url
-        // Single rtspsrc → nvv4l2decoder → tee.
-        // Branch 1 (detection): nvstreammux → nvinfer → nvtracker → fakesink.
-        // Branch 2 (MJPEG):     nvvideoconvert → nvjpegenc → appsink.
-        //
-        // queue max-size-buffers=2 leaky=downstream on the MJPEG branch: natural
-        // frame dropper. When nvjpegenc is slower than the source, older frames
-        // are dropped to keep latency low.
-        //
-        // appsink max-buffers=1 drop=true: when no client is pulling, GStreamer
-        // discards frames at the appsink rather than building up a backlog. This
-        // keeps memory flat when /stream has no viewers.
-        // Pipeline: tee AFTER nvtracker so both branches carry NvDsBatchMeta
-        // (required by nvdsosd to draw boxes). Detection branch is just a
-        // fakesink; the pad probe is on nvtracker's src pad, unchanged.
-        // MJPEG branch: nvvideoconvert (NV12 NVMM → RGBA NVMM) → nvdsosd
-        // draws boxes in-place → nvvideoconvert back → nvjpegenc → appsink.
         return """
         rtspsrc location=\(url) latency=200 protocols=tcp \
         ! rtph264depay ! h264parse \
@@ -393,14 +359,7 @@ actor GStreamerFrameReader {
         ! nvtracker name=wendy_tracker \
             ll-config-file=/app/tracker_config.yml \
             ll-lib-file=/opt/nvidia/deepstream/deepstream-7.1/lib/libnvds_nvmultiobjecttracker.so \
-        ! tee name=t \
-        t. ! queue ! fakesink \
-        t. ! queue max-size-buffers=2 leaky=downstream \
-        ! nvvideoconvert \
-        ! nvdsosd \
-        ! nvvideoconvert \
-        ! nvjpegenc quality=85 \
-        ! appsink name=mjpeg_sink emit-signals=false sync=false max-buffers=1 drop=true
+        ! fakesink
         """
     }
 
@@ -443,10 +402,6 @@ actor GStreamerFrameReader {
             gst_object_unref(UnsafeMutableRawPointer(tracker))
             self.nvtrackerElement = nil
         }
-        if let sink = mjpegSinkElement {
-            gst_object_unref(UnsafeMutableRawPointer(sink))
-            self.mjpegSinkElement = nil
-        }
         if let pipeline = pipeline {
             gst_element_set_state(pipeline, GST_STATE_NULL)
             gst_object_unref(UnsafeMutableRawPointer(pipeline))
@@ -457,8 +412,7 @@ actor GStreamerFrameReader {
 
 // MARK: - GStreamerReader (Sendable wrapper)
 
-/// `Sendable` wrapper that exposes detections as an `AsyncStream<DetectionFrame>`
-/// and provides the MJPEG appsink element for the sidecar pull loop.
+/// `Sendable` wrapper that exposes detections as an `AsyncStream<DetectionFrame>`.
 struct GStreamerReader: Sendable {
     private let reader: GStreamerFrameReader
 
@@ -466,11 +420,8 @@ struct GStreamerReader: Sendable {
         self.reader = GStreamerFrameReader(stream: stream)
     }
 
-    /// Start the DeepStream pipeline and return detections + MJPEG sink.
-    ///
-    /// The MJPEG sink element is valid for the lifetime of the pipeline.
-    /// It is owned by the GStreamerFrameReader; callers must not release it.
-    func start() async throws -> (detections: AsyncStream<DetectionFrame>, mjpegSink: GstElementRef?) {
+    /// Start the DeepStream pipeline and return the detection stream.
+    func start() async throws -> AsyncStream<DetectionFrame> {
         try await reader.start()
     }
 

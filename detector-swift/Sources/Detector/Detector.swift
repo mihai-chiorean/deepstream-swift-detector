@@ -3,11 +3,13 @@
 //
 // Ties together:
 //   - DeepStream pipeline (GStreamerFrameReader) — nvinfer + nvtracker in-pipeline,
-//     plus an MJPEG sidecar branch via tee (single rtspsrc)
-//   - Pad-probe-driven detection stream (AsyncStream<[Detection]>)
-//   - MJPEG distributor (MJPEGSidecar) — pulls from the tee branch's appsink
+//     pure detection path (no tee, no MJPEG branch). Stage 2: video is served by
+//     mediamtx via WebRTC; the detector only publishes detection metadata.
+//   - Pad-probe-driven detection stream (AsyncStream<DetectionFrame>)
+//   - Detection broadcaster (DetectionBroadcaster) — fans out per-frame JSON
+//     to N WebSocket /detections clients; called inline from the detection loop
 //   - Track-finalizer for VLM integration (currently disabled)
-//   - Hummingbird HTTP server on :9090 (metrics, health, stream)
+//   - Hummingbird HTTP server on :9090 (metrics, health, detections)
 //   - Prometheus metrics (Metrics.swift)
 
 import ArgumentParser
@@ -73,13 +75,13 @@ struct Detector: AsyncParsableCommand {
         let vlmClient = VLMClient(baseURL: vlmURL)
         let trackFinalizer = TrackFinalizer(vlmClient: vlmClient)
 
-        // MJPEGSidecar is created upfront and registered with DetectorState so
-        // the HTTP server can hand it to /stream clients immediately. The sidecar
-        // is wired to the actual appsink after the GStreamer pipeline starts.
+        // DetectionBroadcaster is created upfront so /detections WebSocket clients
+        // can subscribe before the pipeline starts. The broadcaster's distribute()
+        // method is called inline from the detection loop on each frame.
         let detectorState = DetectorState()
-        let mjpegSidecar = MJPEGSidecar()
-        await detectorState.setMJPEGSidecar(mjpegSidecar)
-        logger.info("MJPEG sidecar created")
+        let broadcaster = DetectionBroadcaster()
+        await detectorState.setDetectionBroadcaster(broadcaster)
+        logger.info("Detection broadcaster created")
 
         let httpTask = Task {
             do {
@@ -102,7 +104,7 @@ struct Detector: AsyncParsableCommand {
                 group.addTask {
                     await runStreamDetectionLoop(
                         stream: stream,
-                        mjpegSidecar: mjpegSidecar,
+                        broadcaster: broadcaster,
                         trackFinalizer: trackFinalizer,
                         logger: taskLogger
                     )
@@ -119,7 +121,7 @@ struct Detector: AsyncParsableCommand {
 
 private func runStreamDetectionLoop(
     stream: StreamConfig,
-    mjpegSidecar: MJPEGSidecar,
+    broadcaster: DetectionBroadcaster,
     trackFinalizer: TrackFinalizer,
     logger: Logger
 ) async {
@@ -131,6 +133,8 @@ private func runStreamDetectionLoop(
     let activeTracks = activeTracksGauge(stream: stream.name)
     let totalLatency = totalLatencyHistogram(stream: stream.name)
     let decodeLatency = decodeLatencyHistogram(stream: stream.name)
+    let streammuxLatency = streammuxLatencyHistogram(stream: stream.name)
+    let inferenceLatency = inferenceLatencyHistogram(stream: stream.name)
     let preprocessLatency = preprocessLatencyHistogram(stream: stream.name)
     let postprocessLatency = postprocessLatencyHistogram(stream: stream.name)
     var classCounterCache: [String: CounterMetric] = [:]
@@ -143,17 +147,10 @@ private func runStreamDetectionLoop(
     logger.info("Starting DeepStream detection loop")
 
     do {
-        let (detectionStream, mjpegSinkRef) = try await reader.start()
+        let detectionStream = try await reader.start()
 
-        // Wire up the MJPEG sidecar to the appsink in the tee-split pipeline.
-        // This avoids opening a second RTSP connection (camera limit = 1 session).
-        if let sinkRef = mjpegSinkRef {
-            await mjpegSidecar.attachSink(sinkRef)
-            logger.info("MJPEG sidecar wired to pipeline appsink")
-        } else {
-            logger.warning("No MJPEG appsink in pipeline — /stream will not produce frames")
-        }
-
+        // Detection loop: sole consumer of detectionStream.
+        // broadcaster.distribute(frame) is called inline — no secondary consumer.
         for await frame in detectionStream {
             let detections = frame.detections
             let currentTrackerIds = Set(detections.compactMap(\.trackId))
@@ -162,6 +159,10 @@ private func runStreamDetectionLoop(
                 await trackFinalizer.submitDisappeared(trackId: goneId)
             }
             previousTrackerIds = currentTrackerIds
+
+            // Fan out to WebSocket /detections clients (non-blocking; slow clients
+            // drop stale frames via per-client AsyncStream bufferingNewest(4)).
+            await broadcaster.distribute(frame)
 
             frameCount += 1
             framesProcessed.inc()
@@ -174,10 +175,15 @@ private func runStreamDetectionLoop(
 
             // DeepStream component latency histograms.
             // These are non-zero only when NVDS_ENABLE_COMPONENT_LATENCY_MEASUREMENT=1.
-            // The C shim fills them from NVDS_LATENCY_MEASUREMENT_META batch user-metas.
             let t = frame.timing
             if t.decodeMs > 0 {
                 decodeLatency.observe(t.decodeMs)
+            }
+            if t.streammuxMs > 0 {
+                streammuxLatency.observe(t.streammuxMs)
+            }
+            if t.inferenceMs > 0 {
+                inferenceLatency.observe(t.inferenceMs)
             }
             if t.preprocessMs > 0 {
                 preprocessLatency.observe(t.preprocessMs)
@@ -217,7 +223,7 @@ private func runStreamDetectionLoop(
     }
 
     logger.warning("Detection loop ended for stream \(stream.name)")
-    await mjpegSidecar.stop()
+    await broadcaster.stop()
     await reader.stop()
 }
 

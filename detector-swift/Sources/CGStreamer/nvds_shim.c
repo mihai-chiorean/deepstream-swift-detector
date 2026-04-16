@@ -83,15 +83,24 @@ int wendy_nvds_flatten(GstBuffer *buf, WendyDetection *out, int maxOut) {
 //
 // Bucket mapping:
 //   decode_ms      → component_name contains "decoder"
-//   preprocess_ms  → component_name starts with "nvstreammux" OR starts with "nvinfer"
-//                    (accumulated: mux + inference = tensor-prep + DNN forward pass)
+//   streammux_ms   → component_name starts with "nvstreammux"
+//   inference_ms   → component_name starts with "nvinfer"
+//   preprocess_ms  → nvstreammux + nvinfer sum (backwards compat)
 //   postprocess_ms → component_name starts with "wendy_tracker" OR starts with "nvtracker"
+//
+// PTS extraction:
+//   ptsNs          → GST_BUFFER_PTS(buf); -1 if GST_CLOCK_TIME_NONE
 // ---------------------------------------------------------------------------
 
 WendyFrameTiming wendy_extract_frame_timing(GstBuffer *buf) {
-    WendyFrameTiming timing = { 0.0, 0.0, 0.0 };
+    WendyFrameTiming timing = { 0.0, 0.0, 0.0, 0.0, 0.0, -1 };
 
     if (!buf) return timing;
+
+    // Extract buffer PTS (nanoseconds since stream start).
+    // GST_CLOCK_TIME_NONE is all-bits-set (UINT64_MAX); report as -1.
+    GstClockTime pts = GST_BUFFER_PTS(buf);
+    timing.ptsNs = GST_CLOCK_TIME_IS_VALID(pts) ? (int64_t)pts : -1;
 
     NvDsBatchMeta *bm = gst_buffer_get_nvds_batch_meta(buf);
     if (!bm) return timing;
@@ -119,10 +128,13 @@ WendyFrameTiming wendy_extract_frame_timing(GstBuffer *buf) {
         if (strstr(name, "decoder") != NULL) {
             // Covers "nvv4l2decoder", "nvv4l2decoder0", etc.
             timing.decode_ms += latency_ms;
-        } else if (strncmp(name, "nvstreammux", 11) == 0 ||
-                   strncmp(name, "nvinfer", 7) == 0) {
-            // nvstreammux-<name> + nvinfer / nvinfer0 = preprocess bucket.
-            // These two stages together represent buffer batching + DNN execution.
+        } else if (strncmp(name, "nvstreammux", 11) == 0) {
+            // nvstreammux-<name>: buffer batching + pad synchronisation.
+            timing.streammux_ms += latency_ms;
+            timing.preprocess_ms += latency_ms;
+        } else if (strncmp(name, "nvinfer", 7) == 0) {
+            // nvinfer / nvinfer0: letterbox resize + YOLO26n forward pass.
+            timing.inference_ms += latency_ms;
             timing.preprocess_ms += latency_ms;
         } else if (strncmp(name, "wendy_tracker", 13) == 0 ||
                    strncmp(name, "nvtracker", 9) == 0) {
@@ -173,6 +185,7 @@ static GstPadProbeReturn probe_callback(GstPad        *pad,
 
     // Extract per-component latency from DS batch user metas.
     // Returns all-zeros if NVDS_ENABLE_COMPONENT_LATENCY_MEASUREMENT is not set.
+    // Also extracts GST_BUFFER_PTS into timing.ptsNs (-1 if no PTS).
     WendyFrameTiming timing = wendy_extract_frame_timing(buf);
 
     // Stack-allocate enough room for 300 detections (~16 KB — safe on any
