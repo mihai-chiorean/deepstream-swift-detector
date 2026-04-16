@@ -13,7 +13,7 @@ model-engine-file=/app/yolo26n_b2_fp16.engine
 labelfile-path=/app/labels.txt
 
 # Match the engine build.
-batch-size=2
+batch-size=1
 infer-dims=3;640;640
 model-color-format=0          ; RGB (YOLO26 was exported expecting RGB input)
 
