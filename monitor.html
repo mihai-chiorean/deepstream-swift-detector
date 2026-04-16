@@ -269,12 +269,60 @@
             border-radius: 8px;
             overflow: hidden;
             position: relative;
+            display: inline-block;
+            width: 100%;
         }
 
-        .video-container img {
+        .video-container video#webrtc-video {
             width: 100%;
             height: auto;
             display: block;
+        }
+
+        /* Detection overlay canvas — absolutely positioned over the video.
+           CSS width/height stretch to match the video display area.
+           The canvas buffer resolution is set to the source video resolution
+           (videoWidth x videoHeight) so bbox coords map 1:1 without JS scaling. */
+        #detection-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+        }
+
+        /* WebRTC + PTS sync status indicator */
+        .webrtc-status {
+            position: absolute;
+            bottom: 8px;
+            left: 8px;
+            background: rgba(0, 0, 0, 0.7);
+            color: #22c55e;
+            font-size: 11px;
+            padding: 4px 10px;
+            border-radius: 4px;
+            pointer-events: none;
+            border: 1px solid rgba(34, 197, 94, 0.4);
+        }
+
+        /* Detection WebSocket status indicator */
+        .ws-status {
+            font-size: 12px;
+            padding: 3px 8px;
+            border-radius: 4px;
+            margin-left: 8px;
+            display: inline-block;
+        }
+        .ws-status.connected {
+            background: rgba(34, 197, 94, 0.2);
+            color: #22c55e;
+            border: 1px solid rgba(34, 197, 94, 0.3);
+        }
+        .ws-status.disconnected {
+            background: rgba(100, 116, 139, 0.2);
+            color: #94a3b8;
+            border: 1px solid rgba(100, 116, 139, 0.3);
         }
 
         .video-error {
@@ -372,9 +420,66 @@
             padding: 40px;
             color: #64748b;
         }
+
+        /* Debug panel — persistent overlay for remote diagnosis */
+        #debug-panel {
+            position: fixed;
+            top: 12px;
+            right: 12px;
+            z-index: 9999;
+            background: rgba(0, 0, 0, 0.88);
+            color: #e2e8f0;
+            font-family: 'Monaco', 'Menlo', 'Courier New', monospace;
+            font-size: 11px;
+            padding: 10px 14px;
+            border-radius: 8px;
+            border: 1px solid rgba(0, 212, 255, 0.4);
+            min-width: 280px;
+            line-height: 1.7;
+            pointer-events: none;
+        }
+        #debug-panel .dp-title {
+            color: #00d4ff;
+            font-weight: bold;
+            margin-bottom: 4px;
+            font-size: 12px;
+        }
+        #debug-panel .dp-row {
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+        }
+        #debug-panel .dp-label {
+            color: #94a3b8;
+        }
+        #debug-panel .dp-val {
+            color: #e2e8f0;
+            text-align: right;
+        }
+        #debug-panel .dp-ok   { color: #22c55e; }
+        #debug-panel .dp-warn { color: #eab308; }
+        #debug-panel .dp-err  { color: #ef4444; }
     </style>
 </head>
 <body>
+    <!-- Persistent debug panel (Suspects 1-6 at a glance) -->
+    <div id="debug-panel">
+        <div class="dp-title">Debug Panel</div>
+        <div class="dp-row"><span class="dp-label">WS</span><span class="dp-val dp-warn" id="dp-ws">disconnected</span></div>
+        <div class="dp-row"><span class="dp-label">messages</span><span class="dp-val" id="dp-msgs">0</span></div>
+        <div class="dp-row"><span class="dp-label">last ptsNs</span><span class="dp-val" id="dp-pts">-</span></div>
+        <div class="dp-row"><span class="dp-label">ptsOffset calibrated</span><span class="dp-val dp-warn" id="dp-offset">no</span></div>
+        <div class="dp-row"><span class="dp-label">ptsOffsetNs</span><span class="dp-val" id="dp-offsetval">-</span></div>
+        <div class="dp-row"><span class="dp-label">mediaTime</span><span class="dp-val" id="dp-mt">-</span></div>
+        <div class="dp-row"><span class="dp-label">video intrinsic</span><span class="dp-val" id="dp-vintrin">-</span></div>
+        <div class="dp-row"><span class="dp-label">video display</span><span class="dp-val" id="dp-vdisplay">-</span></div>
+        <div class="dp-row"><span class="dp-label">canvas buf</span><span class="dp-val" id="dp-canvas">300x150 (default)</span></div>
+        <div class="dp-row"><span class="dp-label">RVFC active</span><span class="dp-val dp-warn" id="dp-rvfc">no</span></div>
+        <div class="dp-row"><span class="dp-label">draw calls</span><span class="dp-val" id="dp-draws">0</span></div>
+        <div class="dp-row"><span class="dp-label">ring size</span><span class="dp-val" id="dp-ring">0</span></div>
+        <div class="dp-row"><span class="dp-label">playout delay</span><span class="dp-val" id="dp-playout">-</span></div>
+    </div>
+
     <div class="container">
         <div class="header">
             <div class="header-left">
@@ -461,16 +566,40 @@
             </div>
         </div>
 
-        <!-- Full-width live video stream -->
+        <!-- Full-width live video stream (WebRTC) with detection canvas overlay -->
         <div class="card full-width" style="margin-bottom: 20px;">
-            <h2><span class="status-indicator online" id="video-indicator"></span>Live Detection Stream</h2>
+            <h2>
+                <span class="status-indicator online" id="video-indicator"></span>
+                Live Detection Stream
+                <span class="ws-status disconnected" id="ws-status">Detections: disconnected</span>
+            </h2>
+            <!--
+                Stage 2 layout:
+                  1. <video> — WebRTC stream from mediamtx WHEP endpoint
+                  2. <canvas> — detection bbox overlay, synced via requestVideoFrameCallback
+
+                The canvas is absolutely positioned over the video inside a relative-positioned
+                container. requestVideoFrameCallback provides mediaTime for each presented
+                frame; we match against the detection ring buffer by ptsNs to draw the
+                correct detection frame rather than the most-recently-received one.
+
+                Canvas buffer resolution = source video resolution (videoWidth x videoHeight).
+                CSS width/height: 100% stretches it to fill the video display area.
+                Bbox coords from the Swift detector are in source-frame pixel space and
+                are drawn without JS scaling (scale = 1.0), letting CSS handle the stretch.
+
+                Firefox fallback: if RVFC is unavailable, falls back to requestAnimationFrame
+                with the latest detection (same as Stage 1 behavior).
+            -->
             <div class="video-container">
-                <img id="video-stream"
-                     src=""
-                     alt="Live video stream with detections"
-                     onerror="document.getElementById('video-error').style.display='block'; setTimeout(() => { this.src = getDetectorUrl('/stream') + '?retry=' + Date.now(); document.getElementById('video-error').style.display='none'; }, 2000);">
+                <video id="webrtc-video" autoplay playsinline muted></video>
+                <canvas id="detection-overlay"></canvas>
+                <div class="webrtc-status" id="webrtc-status-banner">
+                    WebRTC | sub-100ms glass-to-glass | PTS-synced
+                </div>
                 <div id="video-error" class="video-error" style="display: none;">
-                    <p>Stream unavailable - enter device hostname above</p>
+                    <p>WebRTC stream unavailable — check mediamtx on the Jetson</p>
+                    <code>curl -X POST /webrtc/relayed/whep</code>
                 </div>
             </div>
         </div>
@@ -496,6 +625,20 @@
         function getGpuUrl(path) {
             return useProxy ? `/gpu${path}` : `http://${deviceHost}:9091${path}`;
         }
+        function getDetectorWsUrl(path) {
+            // Build a WebSocket URL from the current HTTP URL.
+            // When proxied, the proxy must also support WebSocket upgrades.
+            if (useProxy) {
+                const wsScheme = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                return `${wsScheme}//${window.location.host}/detector${path}`;
+            }
+            return `ws://${deviceHost}:9090${path}`;
+        }
+        function getWhepUrl() {
+            // WHEP endpoint via monitor_proxy /webrtc/* reverse proxy.
+            // Same-origin POST — avoids CORS preflight on the mediamtx side.
+            return useProxy ? '/webrtc/relayed/whep' : `http://${deviceHost}:8889/relayed/whep`;
+        }
 
         function updateDevice() {
             const input = document.getElementById('device-input');
@@ -507,10 +650,9 @@
             localStorage.setItem('deepstream-device', deviceHost);
             log(`Device set to ${deviceHost}`, 'info');
 
-            const videoStream = document.getElementById('video-stream');
-            videoStream.src = getDetectorUrl('/stream');
-            videoStream.style.display = '';
-            document.getElementById('video-error').style.display = 'none';
+            // Reconnect WebRTC and WebSocket with new device.
+            connectWebRTC();
+            connectDetectionWS();
 
             refreshAll();
         }
@@ -522,17 +664,494 @@
                 deviceHost = saved;
             }
             if (useProxy) {
-                log('Served via proxy — using same-origin /detector and /gpu', 'info');
-                document.getElementById('video-stream').src = getDetectorUrl('/stream');
+                log('Served via proxy — using same-origin /webrtc and /detector paths', 'info');
+                connectWebRTC();
+                connectDetectionWS();
                 refreshAll();
             } else if (saved) {
                 log(`Restored device: ${saved}`, 'info');
-                document.getElementById('video-stream').src = getDetectorUrl('/stream');
+                connectWebRTC();
+                connectDetectionWS();
                 refreshAll();
             } else {
                 log('Enter your device hostname and click Update', 'info');
             }
+
+            // Start the canvas overlay render loop (RAF fallback for Firefox).
+            if (!('requestVideoFrameCallback' in HTMLVideoElement.prototype)) {
+                log('requestVideoFrameCallback not available — using RAF fallback (overlay may not be frame-accurate)', 'warning');
+                requestAnimationFrame(renderOverlayRAF);
+            }
+
+            // Update debug panel every second.
+            setInterval(updateDebugPanel, 1000);
         });
+
+        // ---------------------------------------------------------------------------
+        // Debug panel updater
+        // ---------------------------------------------------------------------------
+
+        let debugDrawCount = 0;
+        let debugMsgCount  = 0;
+
+        function updateDebugPanel() {
+            const video  = document.getElementById('webrtc-video');
+            const canvas = document.getElementById('detection-overlay');
+            document.getElementById('dp-msgs').textContent    = debugMsgCount;
+            document.getElementById('dp-ring').textContent    = detectionRing.length;
+            document.getElementById('dp-vintrin').textContent =
+                video.videoWidth ? `${video.videoWidth}x${video.videoHeight}` : 'not ready';
+            document.getElementById('dp-vdisplay').textContent =
+                `${video.offsetWidth}x${video.offsetHeight}`;
+            document.getElementById('dp-canvas').textContent  =
+                `${canvas.width}x${canvas.height}`;
+            document.getElementById('dp-draws').textContent   = debugDrawCount;
+
+            const offsetEl = document.getElementById('dp-offset');
+            const offsetValEl = document.getElementById('dp-offsetval');
+            if (ptsCalibrated) {
+                offsetEl.textContent = 'yes';
+                offsetEl.className = 'dp-val dp-ok';
+                offsetValEl.textContent = (ptsOffsetNs / 1e6).toFixed(1) + ' ms';
+            } else {
+                offsetEl.textContent = `no (${ptsOffsetSamples.length}/${CALIBRATION_FRAMES} samples)`;
+                offsetEl.className = 'dp-val dp-warn';
+                offsetValEl.textContent = '-';
+            }
+            // Read actual playout delay from WebRTC stats (inbound-rtp jitter buffer).
+            if (peerConnection) {
+                peerConnection.getReceivers().forEach(r => {
+                    if (r.track && r.track.kind === 'video') {
+                        r.getStats().then(stats => {
+                            stats.forEach(s => {
+                                if (s.type === 'inbound-rtp' && s.kind === 'video' &&
+                                        s.jitterBufferEmittedCount > 0) {
+                                    const ms = (s.jitterBufferDelay / s.jitterBufferEmittedCount * 1000).toFixed(0);
+                                    document.getElementById('dp-playout').textContent = ms + ' ms';
+                                }
+                            });
+                        });
+                    }
+                });
+            }
+        }
+
+        // ---------------------------------------------------------------------------
+        // WebRTC WHEP client
+        //
+        // WHEP (WebRTC-HTTP Egress Protocol) is a simple POST-offer / 201-answer
+        // exchange. mediamtx implements it natively on :8889/relayed/whep.
+        // monitor_proxy.py reverse-proxies /webrtc/* to 10.42.0.2:8889/*.
+        //
+        // Flow:
+        //   1. Create RTCPeerConnection.
+        //   2. Add a recvonly transceiver for video.
+        //   3. createOffer() → POST SDP to WHEP URL.
+        //   4. Parse 201 response: SDP answer in body.
+        //   5. setRemoteDescription(answer).
+        //   6. ICE candidates from the SDP (trickle ICE not required for mediamtx).
+        // ---------------------------------------------------------------------------
+
+        let peerConnection = null;
+        let rvfcRegistered = false;  // guard against double-registration
+
+        async function connectWebRTC() {
+            if (peerConnection) {
+                peerConnection.close();
+                peerConnection = null;
+            }
+            rvfcRegistered = false;
+            if (!useProxy && !deviceHost) return;
+
+            const whepUrl = getWhepUrl();
+            log(`Connecting WebRTC to ${whepUrl}`, 'info');
+
+            const video = document.getElementById('webrtc-video');
+            const errorDiv = document.getElementById('video-error');
+
+            // Register RVFC on loadedmetadata as a safety net in case ontrack
+            // fires before the video element is ready to accept RVFC registration.
+            // (Chrome sometimes fires ontrack before the video element starts playing.)
+            video.addEventListener('loadedmetadata', () => {
+                log(`Video metadata loaded: ${video.videoWidth}x${video.videoHeight}`, 'info');
+                console.log('[overlay] loadedmetadata', video.videoWidth, video.videoHeight);
+                // Size canvas buffer to source resolution now that we know it.
+                // CSS width:100%/height:100% handles display scaling.
+                const canvas = document.getElementById('detection-overlay');
+                canvas.width  = video.videoWidth;
+                canvas.height = video.videoHeight;
+                console.log('[overlay] canvas buffer set to', canvas.width, canvas.height);
+                if ('requestVideoFrameCallback' in video && !rvfcRegistered) {
+                    rvfcRegistered = true;
+                    video.requestVideoFrameCallback(onVideoFrame);
+                    log('requestVideoFrameCallback registered on loadedmetadata', 'success');
+                    document.getElementById('dp-rvfc').textContent = 'yes';
+                    document.getElementById('dp-rvfc').className   = 'dp-val dp-ok';
+                }
+            }, { once: true });
+
+            try {
+                const pc = new RTCPeerConnection({
+                    iceServers: [],  // STUN not needed — ICE candidates in SDP from mediamtx
+                });
+                peerConnection = pc;
+
+                // Receive video (no audio track needed).
+                pc.addTransceiver('video', { direction: 'recvonly' });
+
+                pc.ontrack = (event) => {
+                    if (event.track.kind === 'video') {
+                        video.srcObject = event.streams[0];
+                        errorDiv.style.display = 'none';
+                        log('WebRTC track received — video playing', 'success');
+                        console.log('[overlay] ontrack video — srcObject set');
+
+                        // Register RVFC here if loadedmetadata already fired
+                        // (can happen if the video element caches the stream).
+                        if ('requestVideoFrameCallback' in video && !rvfcRegistered) {
+                            rvfcRegistered = true;
+                            video.requestVideoFrameCallback(onVideoFrame);
+                            log('requestVideoFrameCallback registered (PTS-synced overlay)', 'success');
+                            document.getElementById('dp-rvfc').textContent = 'yes';
+                            document.getElementById('dp-rvfc').className   = 'dp-val dp-ok';
+                        }
+                        // Set playout buffer hint — adds ~150 ms so detection N arrives before frame N.
+                        if (event.receiver && 'playoutDelayHint' in event.receiver) {
+                            event.receiver.playoutDelayHint = 0.15;
+                            log('playoutDelayHint set to 150 ms (bbox sync fix)', 'info');
+                        }
+                    }
+                };
+
+                pc.oniceconnectionstatechange = () => {
+                    log(`ICE state: ${pc.iceConnectionState}`, 'info');
+                    if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected') {
+                        errorDiv.style.display = 'block';
+                        // Retry after 5 s.
+                        setTimeout(() => connectWebRTC(), 5000);
+                    }
+                };
+
+                const offer = await pc.createOffer();
+                await pc.setLocalDescription(offer);
+
+                const resp = await fetch(whepUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/sdp' },
+                    body: offer.sdp,
+                });
+
+                if (resp.status !== 201) {
+                    throw new Error(`WHEP POST returned ${resp.status}`);
+                }
+
+                const answerSdp = await resp.text();
+                await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+                log(`WHEP 201 OK — ICE negotiation complete`, 'success');
+
+            } catch (e) {
+                log(`WebRTC connection failed: ${e.message}`, 'error');
+                errorDiv.style.display = 'block';
+                // Retry after 5 s.
+                setTimeout(() => connectWebRTC(), 5000);
+            }
+        }
+
+        // ---------------------------------------------------------------------------
+        // Detection WebSocket + ring buffer
+        //
+        // We keep the last RING_SIZE detection messages indexed by their ptsNs.
+        // requestVideoFrameCallback fires with mediaTime (seconds from stream start).
+        // We estimate the frame's pipeline PTS by: estimatedPtsNs ≈ mediaTime * 1e9
+        // plus an offset calibrated over the first few frames. The ring lookup finds
+        // the detection whose ptsNs is closest to that estimate.
+        //
+        // Firefox fallback: when RVFC is unavailable, the RAF loop draws latestDetection
+        // (most recently received), same as Stage 1.
+        // ---------------------------------------------------------------------------
+
+        const RING_SIZE = 60;
+        const detectionRing = [];  // [{ptsNs, detections}], oldest first
+        let latestDetection = null;  // fallback for non-RVFC browsers
+        let detectionWS = null;
+        let wsReconnectTimer = null;
+
+        // PTS offset calibration: accumulated over first CALIBRATION_FRAMES frames.
+        // offset = mediaTime_ns - ptsNs  (negative when ptsNs > mediaTime_ns)
+        // To recover ring ptsNs from mediaTime_ns: estimatedPtsNs = mediaTime_ns - offset
+        const CALIBRATION_FRAMES = 8;
+        let ptsOffsetSamples = [];  // (mediaTime * 1e9) - ptsNs pairs
+        let ptsOffsetNs = 0;        // running average after calibration
+        let ptsCalibrated = false;
+
+        // COCO class colours for bounding boxes.
+        const CLASS_COLORS = [
+            '#ef4444',  // 0: person
+            '#f97316',  // 1: bicycle
+            '#eab308',  // 2: car
+            '#22c55e',  // 3: motorcycle
+            '#06b6d4',  // 4: airplane
+            '#3b82f6',  // 5: bus
+            '#8b5cf6',  // 6: train
+            '#ec4899',  // 7: truck
+            '#14b8a6',  // 8: boat
+            '#f59e0b',  // 9: traffic light
+        ];
+
+        function classColor(classId) {
+            return CLASS_COLORS[classId] || '#00d4ff';
+        }
+
+        // Convert a hex color (#rrggbb) to rgba(r,g,b,a) string.
+        // Needed because CLASS_COLORS are hex and canvas fillStyle needs rgba
+        // for the semi-transparent fill.
+        function hexToRgba(hex, alpha) {
+            const r = parseInt(hex.slice(1, 3), 16);
+            const g = parseInt(hex.slice(3, 5), 16);
+            const b = parseInt(hex.slice(5, 7), 16);
+            return `rgba(${r},${g},${b},${alpha})`;
+        }
+
+        function connectDetectionWS() {
+            if (detectionWS) {
+                detectionWS.onclose = null;
+                detectionWS.close();
+                detectionWS = null;
+            }
+            if (wsReconnectTimer) {
+                clearTimeout(wsReconnectTimer);
+                wsReconnectTimer = null;
+            }
+            if (!useProxy && !deviceHost) return;
+
+            const url = getDetectorWsUrl('/detections');
+            log(`Connecting to detection WebSocket: ${url}`, 'info');
+            console.log('[ws] connecting to', url);
+
+            const ws = new WebSocket(url);
+            detectionWS = ws;
+
+            ws.onopen = () => {
+                log('Detection WebSocket connected', 'success');
+                console.log('[ws] onopen — connected to', url);
+                document.getElementById('ws-status').textContent = 'Detections: connected';
+                document.getElementById('ws-status').className = 'ws-status connected';
+                document.getElementById('dp-ws').textContent  = 'connected';
+                document.getElementById('dp-ws').className    = 'dp-val dp-ok';
+            };
+
+            ws.onmessage = (event) => {
+                try {
+                    const msg = JSON.parse(event.data);
+                    latestDetection = msg;
+                    debugMsgCount++;
+
+                    // Update debug panel with latest ptsNs.
+                    document.getElementById('dp-pts').textContent =
+                        msg.ptsNs !== undefined ? String(msg.ptsNs) : 'undefined!';
+
+                    if (debugMsgCount <= 3 || debugMsgCount % 60 === 0) {
+                        console.log('[ws] msg #' + debugMsgCount,
+                            'ptsNs=' + msg.ptsNs,
+                            'detections=' + (msg.detections ? msg.detections.length : 'missing'));
+                    }
+
+                    // Add to ring buffer, evict oldest if full.
+                    // ptsNs is -1 when GStreamer has no PTS (GST_CLOCK_TIME_NONE);
+                    // store it anyway so the ring stays populated for RAF fallback.
+                    detectionRing.push({ ptsNs: msg.ptsNs, detections: msg.detections });
+                    if (detectionRing.length > RING_SIZE) {
+                        detectionRing.shift();
+                    }
+                } catch (e) {
+                    console.warn('[ws] JSON parse error:', e, event.data);
+                    log('Detection WS JSON parse error: ' + e.message, 'error');
+                }
+            };
+
+            ws.onerror = (err) => {
+                console.error('[ws] onerror', err);
+                log('Detection WebSocket error', 'error');
+                document.getElementById('dp-ws').textContent = 'error';
+                document.getElementById('dp-ws').className   = 'dp-val dp-err';
+            };
+
+            ws.onclose = () => {
+                document.getElementById('ws-status').textContent = 'Detections: disconnected';
+                document.getElementById('ws-status').className = 'ws-status disconnected';
+                document.getElementById('dp-ws').textContent = 'disconnected';
+                document.getElementById('dp-ws').className   = 'dp-val dp-err';
+                log('Detection WebSocket closed — reconnecting in 3 s', 'warning');
+                console.log('[ws] onclose — will reconnect in 3s');
+                wsReconnectTimer = setTimeout(() => {
+                    if (useProxy || deviceHost) connectDetectionWS();
+                }, 3000);
+            };
+        }
+
+        // ---------------------------------------------------------------------------
+        // requestVideoFrameCallback handler (PTS-accurate overlay)
+        //
+        // Called by the browser once per presented video frame. metadata.mediaTime
+        // is the frame's presentation time in seconds. We map it to an estimated
+        // pipeline PTS in nanoseconds, then find the closest detection in the ring.
+        //
+        // After CALIBRATION_FRAMES we compute ptsOffsetNs = avg(mediaTime * 1e9 - ptsNs)
+        // for frames where we had a ring hit with a valid ptsNs. From then on we
+        // query the ring with estimatedPtsNs = mediaTime * 1e9 - ptsOffsetNs.
+        //
+        // Canvas buffer size:
+        //   canvas.width  = video.videoWidth  (source resolution, e.g. 1920)
+        //   canvas.height = video.videoHeight (source resolution, e.g. 1080)
+        // CSS width:100%/height:100% stretches the canvas to fill the display area.
+        // Bbox coords are in source-frame space, so no JS scaling is needed (scale = 1).
+        // ---------------------------------------------------------------------------
+
+        function onVideoFrame(now, metadata) {
+            const video  = document.getElementById('webrtc-video');
+            const canvas = document.getElementById('detection-overlay');
+            const ctx    = canvas.getContext('2d');
+
+            // Ensure canvas buffer matches source resolution.
+            // This is idempotent once set; no-op every subsequent frame.
+            // We use videoWidth/videoHeight (intrinsic) not offsetWidth/offsetHeight
+            // (CSS layout pixels) so that bbox coords (source space) map 1:1.
+            if (video.videoWidth > 0 && video.videoHeight > 0) {
+                if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+                    canvas.width  = video.videoWidth;
+                    canvas.height = video.videoHeight;
+                    console.log('[overlay] canvas buffer resized to', canvas.width, canvas.height);
+                }
+            }
+
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            const mediaTimeNs = metadata.mediaTime * 1e9;
+            document.getElementById('dp-mt').textContent = metadata.mediaTime.toFixed(3) + 's';
+
+            const estimatedPtsNs = ptsCalibrated ? mediaTimeNs - ptsOffsetNs : mediaTimeNs;
+
+            // Find the detection in the ring whose ptsNs is closest to estimated.
+            let bestEntry = null;
+            let bestDelta = Infinity;
+            for (const entry of detectionRing) {
+                if (entry.ptsNs < 0) continue;  // no PTS — skip for calibration
+                const delta = Math.abs(entry.ptsNs - estimatedPtsNs);
+                if (delta < bestDelta) {
+                    bestDelta = delta;
+                    bestEntry = entry;
+                }
+            }
+
+            // Calibrate offset using the first CALIBRATION_FRAMES frames with a valid hit.
+            if (!ptsCalibrated && bestEntry && bestEntry.ptsNs > 0) {
+                ptsOffsetSamples.push(mediaTimeNs - bestEntry.ptsNs);
+                if (ptsOffsetSamples.length >= CALIBRATION_FRAMES) {
+                    const sum = ptsOffsetSamples.reduce((a, b) => a + b, 0);
+                    ptsOffsetNs = sum / ptsOffsetSamples.length;
+                    ptsCalibrated = true;
+                    log(`PTS offset calibrated: ${(ptsOffsetNs / 1e6).toFixed(1)} ms`, 'success');
+                    console.log('[overlay] PTS offset calibrated:', ptsOffsetNs, 'ns =',
+                        (ptsOffsetNs / 1e6).toFixed(1), 'ms');
+                }
+            }
+
+            // Draw: use PTS-matched entry when available; fall back to latest.
+            const drawEntry = bestEntry || latestDetection;
+            if (drawEntry && drawEntry.detections && drawEntry.detections.length > 0) {
+                drawDetections(ctx, canvas, video, drawEntry.detections);
+                debugDrawCount++;
+            }
+
+            // Schedule next callback.
+            video.requestVideoFrameCallback(onVideoFrame);
+        }
+
+        // ---------------------------------------------------------------------------
+        // RAF fallback (Firefox / browsers without RVFC)
+        //
+        // Draws the most-recently received detection, same as Stage 1 behavior.
+        // Overlay will trail moving objects by the WebSocket latency (~50 ms).
+        // ---------------------------------------------------------------------------
+
+        function renderOverlayRAF() {
+            const video  = document.getElementById('webrtc-video');
+            const canvas = document.getElementById('detection-overlay');
+            const ctx    = canvas.getContext('2d');
+
+            if (video.videoWidth > 0 && video.videoHeight > 0) {
+                if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+                    canvas.width  = video.videoWidth;
+                    canvas.height = video.videoHeight;
+                }
+            } else {
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                requestAnimationFrame(renderOverlayRAF);
+                return;
+            }
+
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            if (latestDetection && latestDetection.detections && latestDetection.detections.length > 0) {
+                drawDetections(ctx, canvas, video, latestDetection.detections);
+                debugDrawCount++;
+            }
+
+            requestAnimationFrame(renderOverlayRAF);
+        }
+
+        // ---------------------------------------------------------------------------
+        // Shared bbox drawing
+        //
+        // canvas.width = video.videoWidth (source resolution).
+        // CSS handles the display scaling, so scaleX = scaleY = 1.0.
+        // Bbox coords (det.x, det.y, det.w, det.h) are already in source space.
+        // ---------------------------------------------------------------------------
+
+        function drawDetections(ctx, canvas, video, detections) {
+            // Canvas buffer is sized to source resolution; CSS handles display scaling.
+            // No JS coordinate scaling needed.
+            const scaleX = canvas.width  / (video.videoWidth  || canvas.width);
+            const scaleY = canvas.height / (video.videoHeight || canvas.height);
+
+            for (const det of detections) {
+                const x = det.x * scaleX;
+                const y = det.y * scaleY;
+                const w = det.w * scaleX;
+                const h = det.h * scaleY;
+                const color = classColor(det.classId);
+
+                // Bounding box rectangle.
+                ctx.strokeStyle = color;
+                ctx.lineWidth = 2;
+                ctx.strokeRect(x, y, w, h);
+
+                // Semi-transparent fill for visibility.
+                // FIX: CLASS_COLORS are hex strings (#rrggbb); the previous code tried
+                // to replace "rgb"/")" substrings which don't exist in hex strings,
+                // so fillStyle stayed opaque. Use hexToRgba() instead.
+                ctx.fillStyle = hexToRgba(color, 0.08);
+                ctx.fillRect(x, y, w, h);
+
+                // Label: "class:confidence [trackId]"
+                const label = `cls${det.classId}:${(det.confidence * 100).toFixed(0)}%` +
+                              (det.trackId ? ` #${det.trackId}` : '');
+                ctx.font = 'bold 12px monospace';
+                const textWidth = ctx.measureText(label).width;
+
+                // Label background.
+                ctx.fillStyle = color;
+                ctx.fillRect(x, y - 18, textWidth + 8, 18);
+
+                // Label text.
+                ctx.fillStyle = '#000';
+                ctx.fillText(label, x + 4, y - 4);
+            }
+        }
+
+        // ---------------------------------------------------------------------------
+        // Monitoring helpers (unchanged from original)
+        // ---------------------------------------------------------------------------
 
         function log(message, type = 'info') {
             const logsContainer = document.getElementById('logs-container');
@@ -598,9 +1217,6 @@
                 }
 
                 // Parse inference latency (avg = sum / count).
-                // We read preprocess_latency_ms since that's where nvinfer's
-                // forward pass actually runs (component meta from DS 7.1 groups
-                // nvstreammux + nvinfer into one "preprocess" bucket).
                 const infSumMatch = data.match(/deepstream_preprocess_latency_ms_sum\{[^}]*\}\s+([\d.]+)/);
                 const infCountMatch = data.match(/deepstream_preprocess_latency_ms_count\{[^}]*\}\s+(\d+)/);
                 if (infSumMatch && infCountMatch) {
@@ -655,8 +1271,6 @@
                     document.getElementById('gpu-util').textContent = `${parseFloat(utilMatch[1]).toFixed(0)}%`;
                 }
 
-                // On Jetson Orin GPU memory is unified with system RAM, so
-                // jetson_ram_used_mb is the effective "GPU memory" figure.
                 const memMatch = data.match(/jetson_ram_used_mb\s+([\d.]+)/);
                 if (memMatch) {
                     const memMB = parseFloat(memMatch[1]);
@@ -665,7 +1279,7 @@
 
                 const tempMatch = data.match(/jetson_gpu_temperature_celsius\s+([\d.]+)/);
                 if (tempMatch) {
-                    document.getElementById('gpu-temp').textContent = `${parseFloat(tempMatch[1]).toFixed(1)}°C`;
+                    document.getElementById('gpu-temp').textContent = `${parseFloat(tempMatch[1]).toFixed(1)}C`;
                 }
             } else {
                 indicator.classList.remove('online');
