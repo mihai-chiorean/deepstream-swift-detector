@@ -235,3 +235,20 @@ static inline int wendy_gst_get_sample_dimensions(
     *out_height = height;
     return 1;
 }
+
+// Set a gboolean property on any GstElement via g_object_set.
+//
+// Used to toggle valve's "drop" property at runtime without requiring Swift to
+// call g_object_set directly (which is a variadic C function Swift cannot call).
+// Thread-safe on a PLAYING pipeline — GStreamer's object property machinery
+// uses its own locking.
+//
+// Example: wendy_gst_set_bool_property(valve, "drop", 0) to open the valve.
+//          wendy_gst_set_bool_property(valve, "drop", 1) to close it.
+static inline void wendy_gst_set_bool_property(
+    GstElement *element,
+    const gchar *name,
+    gboolean value
+) {
+    g_object_set(G_OBJECT(element), name, value, NULL);
+}

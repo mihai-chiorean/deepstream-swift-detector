@@ -6,6 +6,7 @@ let package = Package(
     platforms: [.macOS(.v15)],
     dependencies: [
         .package(url: "https://github.com/hummingbird-project/hummingbird", from: "2.6.0"),
+        .package(url: "https://github.com/hummingbird-project/hummingbird-websocket", from: "2.0.0"),
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.5.0"),
         .package(url: "https://github.com/apple/swift-log", from: "1.6.0"),
         .package(url: "https://github.com/swift-server/async-http-client", from: "1.23.0"),
@@ -59,6 +60,7 @@ let package = Package(
             name: "Detector",
             dependencies: [
                 .product(name: "Hummingbird", package: "hummingbird"),
+                .product(name: "HummingbirdWebSocket", package: "hummingbird-websocket"),
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
                 .product(name: "Logging", package: "swift-log"),
                 .product(name: "AsyncHTTPClient", package: "async-http-client"),
