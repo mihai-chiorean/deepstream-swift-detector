@@ -15,8 +15,28 @@
 // Concurrency contract:
 //   The GStreamer streaming thread calls the @convention(c) probe callback.
 //   The callback captures a DetectionStream via Unmanaged (retained at
-//   install, released in stop()). AsyncStream.Continuation.yield is safe
-//   from any thread.
+//   install, released in teardownPipeline()). AsyncStream.Continuation.yield
+//   is safe from any thread.
+//
+// Reconnect design:
+//   GStreamerFrameReader.runWithReconnect() drives an exponential-backoff loop
+//   that rebuilds the GStreamer pipeline on EOS or ERROR without finishing the
+//   long-lived DetectionStream. WebSocket subscribers created before the first
+//   disconnect continue to receive frames after recovery.
+//
+//   Bus polling uses wendy_gst_bus_pop_error (non-blocking) checked every
+//   500 ms from a Task.sleep loop — no GLib main loop thread needed.
+//
+//   Each pipeline cycle installs a fresh pad probe and tears it down cleanly
+//   before rebuilding. The retained DetectionStream box is released and
+//   re-retained each cycle, so there is exactly one active retain per cycle.
+//
+//   Teardown order per cycle:
+//     1. Remove pad probe (wendy_gst_pad_remove_probe via shim)
+//     2. Release retained box (balances passRetained from startPipeline)
+//     3. gst_element_set_state → NULL
+//     4. gst_object_unref pipeline + tracker element
+//   gst_init is called only once (cold start); subsequent cycles skip it.
 
 import CGStreamer
 import Logging
@@ -132,7 +152,7 @@ final class DetectionStream: @unchecked Sendable {
         ))
     }
 
-    /// Finish the stream (called on pipeline teardown).
+    /// Finish the stream (called on final teardown — NOT on reconnect).
     func finish() {
         continuation.finish()
     }
@@ -143,8 +163,8 @@ final class DetectionStream: @unchecked Sendable {
 /// GStreamer streaming-thread callback. Must be a free function with C linkage.
 ///
 /// userData is a retained `DetectionStream` pointer (Unmanaged.passRetained
-/// in `GStreamerFrameReader.start()`). We use `takeUnretainedValue()` because
-/// the object is retained until `stop()` calls `release()` on the stored box.
+/// in `GStreamerFrameReader.startPipeline()`). We use `takeUnretainedValue()` because
+/// the object is retained until `teardownPipeline()` calls `release()` on the stored box.
 @_cdecl("wendy_detection_probe_entry")
 func wendyDetectionProbeEntry(
     count: Int32,
@@ -190,6 +210,14 @@ func wendyDetectionProbeEntry(
     ds.ingest(copy, frameLatencyNs: frameLatencyNs, timing: timing)
 }
 
+// MARK: - ReconnectTrigger
+
+/// Signals why a pipeline cycle ended.
+enum ReconnectTrigger: Sendable {
+    case eos
+    case error(String)
+}
+
 // MARK: - GStreamerFrameReader
 
 /// Actor that owns a DeepStream GStreamer pipeline and exposes detections as
@@ -199,6 +227,9 @@ func wendyDetectionProbeEntry(
 /// Video is delivered by mediamtx via WebRTC. The detector pipeline is:
 ///   rtspsrc → rtph264depay → h264parse → nvv4l2decoder
 ///     → nvstreammux → nvinfer → nvtracker → fakesink
+///
+/// Reconnect: call `runWithReconnect(onTrigger:)` instead of `start()` to
+/// enable automatic EOS/error recovery with exponential backoff.
 actor GStreamerFrameReader {
 
     // MARK: Configuration
@@ -207,21 +238,25 @@ actor GStreamerFrameReader {
 
     // MARK: Pipeline state
 
-    /// `GstElement *` for the parsed pipeline. NULL until `start()` succeeds.
+    /// `GstElement *` for the parsed pipeline. NULL until `startPipeline()` succeeds.
     private var pipeline: UnsafeMutablePointer<GstElement>?
 
     /// `GstElement *` for the nvtracker element (probe target).
     private var nvtrackerElement: UnsafeMutablePointer<GstElement>?
 
-    /// The live DetectionStream instance feeding the AsyncStream.
+    /// The long-lived DetectionStream instance. Created once; NOT finished on reconnect.
+    /// The probe writes into the same continuation across all pipeline cycles.
     private var detectionStream: DetectionStream?
 
-    /// Raw opaque pointer from Unmanaged.passRetained — stored so stop() can
-    /// call fromOpaque(...).release() to balance the retain taken in start().
+    /// Raw opaque pointer from Unmanaged.passRetained — stored so teardownPipeline()
+    /// can call fromOpaque(...).release() to balance the retain taken in startPipeline().
     private var retainedBox: UnsafeMutableRawPointer?
 
     /// Probe ID returned by wendy_install_detection_probe.
     private var probeId: gulong = 0
+
+    /// Whether gst_init has been called at least once.
+    private var gstInited = false
 
     private var isRunning = false
     private let logger: Logger
@@ -233,13 +268,16 @@ actor GStreamerFrameReader {
         self.logger = Logger(label: "GStreamerFrameReader[\(stream.name)]")
     }
 
-    // MARK: Lifecycle
+    // MARK: Lifecycle (original — cold start, unchanged)
 
     /// Initialise GStreamer, parse the DeepStream pipeline, install the pad
     /// probe, and transition to PLAYING.
     ///
     /// Returns the detection AsyncStream. No MJPEG sink or valve — Stage 2
     /// removed the MJPEG branch entirely.
+    ///
+    /// This method is the original cold-start path and remains unchanged for
+    /// callers that don't need reconnect semantics.
     func start() throws -> AsyncStream<DetectionFrame> {
         guard !isRunning else {
             guard let ds = detectionStream else {
@@ -248,10 +286,193 @@ actor GStreamerFrameReader {
             return ds.stream
         }
 
-        setupPluginEnvironment()
-        gst_init(nil, nil)
-        scanPluginPaths()
+        if !gstInited {
+            setupPluginEnvironment()
+            gst_init(nil, nil)
+            scanPluginPaths()
+            gstInited = true
+        }
 
+        // Create the long-lived DetectionStream if not already created.
+        let ds: DetectionStream
+        if let existing = detectionStream {
+            ds = existing
+        } else {
+            ds = DetectionStream()
+            self.detectionStream = ds
+        }
+
+        try startPipeline(ds: ds)
+
+        isRunning = true
+        logger.info("DeepStream pipeline started (pure detection, no MJPEG branch)", metadata: [
+            "stream": "\(stream.name)",
+        ])
+
+        return ds.stream
+    }
+
+    /// Transition the pipeline to NULL and release all GStreamer resources.
+    /// Finishes the DetectionStream so the consumer loop exits.
+    func stop() {
+        isRunning = false
+
+        detectionStream?.finish()
+        detectionStream = nil
+
+        teardownPipeline()
+
+        logger.info("DeepStream pipeline stopped", metadata: [
+            "stream": "\(stream.name)",
+        ])
+    }
+
+    // MARK: Reconnect loop
+
+    /// Run the detection pipeline with automatic EOS/error reconnect.
+    ///
+    /// This method drives an exponential-backoff reconnect loop. On EOS or
+    /// pipeline error the pipeline is torn down, the reconnect counter is
+    /// incremented, the FPS gauge is reset to 0 (stale value would otherwise
+    /// remain frozen until the next window), and the pipeline is rebuilt from
+    /// the same StreamConfig. The DetectionStream continuation is NOT finished
+    /// across reconnect cycles — existing subscribers keep their
+    /// `AsyncStream<DetectionFrame>` and resume receiving frames after recovery.
+    ///
+    /// Returns the detection stream (created once; reused across cycles).
+    /// The caller should start consuming the stream before calling this method
+    /// or immediately after (the AsyncStream buffers up to 4 frames).
+    ///
+    /// Metrics reset semantics per reconnect cycle:
+    ///   - `deepstream_fps{stream}` is set to 0. The consumer loop's FPS window
+    ///     also resets (caller responsibility via `onCycleStart` callback).
+    ///   - `deepstream_reconnects_total{stream}` is incremented by 1.
+    ///   - All histograms and the frames_processed counter continue accumulating
+    ///     across reconnects (they are monotonic by convention; resetting them
+    ///     would break Prometheus rate() queries that span a reconnect).
+    ///
+    /// Parameters:
+    ///   - fpsGauge: The FPS GaugeMetric for this stream (reset to 0 on reconnect).
+    ///   - reconnectsCounter: The reconnects CounterMetric for this stream (inc on reconnect).
+    ///   - onCycleStart: Called at the beginning of every pipeline cycle (including
+    ///     the first). Use this to reset FPS window state in the caller.
+    func runWithReconnect(
+        fpsGauge: GaugeMetric,
+        reconnectsCounter: CounterMetric,
+        onCycleStart: @escaping @Sendable () -> Void
+    ) async throws -> AsyncStream<DetectionFrame> {
+        if !gstInited {
+            setupPluginEnvironment()
+            gst_init(nil, nil)
+            scanPluginPaths()
+            gstInited = true
+        }
+
+        // Create the long-lived DetectionStream once.
+        let ds: DetectionStream
+        if let existing = detectionStream {
+            ds = existing
+        } else {
+            let fresh = DetectionStream()
+            self.detectionStream = fresh
+            ds = fresh
+        }
+
+        // Start the first pipeline cycle.
+        onCycleStart()
+        try startPipeline(ds: ds)
+        isRunning = true
+        logger.info("DeepStream pipeline started (cycle 0)", metadata: ["stream": "\(stream.name)"])
+
+        // Launch the bus-watch/reconnect loop as a detached child of the actor's context.
+        // We use Task { } (not Task.detached) so it inherits the actor's isolation,
+        // which lets us call actor-isolated helpers directly.
+        Task {
+            var backoffSeconds: UInt64 = 2
+            let maxBackoffSeconds: UInt64 = 30
+
+            while !Task.isCancelled {
+                // Poll bus every 500 ms. This is cheap (non-blocking C call).
+                try? await Task.sleep(nanoseconds: 500_000_000)
+
+                guard !Task.isCancelled else { break }
+
+                // Must be on the actor to read self.pipeline.
+                let trigger = self.pollBus()
+                guard let trigger else { continue }
+
+                // Pipeline ended — tear down this cycle.
+                switch trigger {
+                case .eos:
+                    self.logger.warning("Pipeline EOS detected — will reconnect", metadata: [
+                        "stream": "\(self.stream.name)",
+                        "backoffSeconds": "\(backoffSeconds)",
+                    ])
+                case .error(let msg):
+                    self.logger.error("Pipeline error detected — will reconnect", metadata: [
+                        "stream": "\(self.stream.name)",
+                        "error": "\(msg)",
+                        "backoffSeconds": "\(backoffSeconds)",
+                    ])
+                }
+
+                self.teardownPipeline()
+                self.isRunning = false
+
+                // Reset metrics that would otherwise report stale values.
+                fpsGauge.set(0)
+                reconnectsCounter.inc()
+
+                // Wait backoff before rebuilding.
+                try? await Task.sleep(nanoseconds: backoffSeconds * 1_000_000_000)
+                guard !Task.isCancelled else { break }
+
+                // Exponential backoff, capped at maxBackoffSeconds.
+                backoffSeconds = min(backoffSeconds * 2, maxBackoffSeconds)
+
+                // Rebuild pipeline on same stream config.
+                do {
+                    onCycleStart()
+                    try self.startPipeline(ds: ds)
+                    self.isRunning = true
+                    // Reset backoff on successful reconnect.
+                    backoffSeconds = 2
+                    self.logger.info("Pipeline reconnected successfully", metadata: [
+                        "stream": "\(self.stream.name)",
+                    ])
+                } catch {
+                    self.logger.error("Pipeline rebuild failed — will retry", metadata: [
+                        "stream": "\(self.stream.name)",
+                        "error": "\(error)",
+                    ])
+                    // Don't reset backoff on failure; next iteration will retry.
+                }
+            }
+        }
+
+        return ds.stream
+    }
+
+    /// Stop the reconnect loop and pipeline. Finishes the DetectionStream.
+    func stopReconnecting() {
+        isRunning = false
+        detectionStream?.finish()
+        detectionStream = nil
+        teardownPipeline()
+        logger.info("DeepStream pipeline stopped (reconnect mode)", metadata: [
+            "stream": "\(stream.name)",
+        ])
+    }
+
+    // MARK: Private — single pipeline cycle
+
+    /// Start one pipeline cycle: parse → find tracker → install probe → PLAYING.
+    ///
+    /// Precondition: gst_init has been called. `ds` is the long-lived DetectionStream.
+    /// Postcondition on success: `self.pipeline`, `self.nvtrackerElement`,
+    ///   `self.retainedBox`, and `self.probeId` are all set.
+    /// On failure: all resources acquired so far are released and an error is thrown.
+    private func startPipeline(ds: DetectionStream) throws {
         let pipelineString = buildPipelineString()
         logger.info("Launching DeepStream pipeline", metadata: [
             "pipeline": "\(pipelineString)",
@@ -273,16 +494,16 @@ actor GStreamerFrameReader {
 
         let bin = wendy_gst_bin_cast(parsed)
 
-        // Find the nvtracker element by name to attach the probe.
         guard let tracker = gst_bin_get_by_name(bin, "wendy_tracker") else {
-            cleanup()
+            // Release parsed pipeline before throwing.
+            gst_element_set_state(parsed, GST_STATE_NULL)
+            gst_object_unref(UnsafeMutableRawPointer(parsed))
+            self.pipeline = nil
             throw GStreamerError.elementNotFound("wendy_tracker")
         }
         self.nvtrackerElement = tracker
 
-        // Create the DetectionStream and retain it for the lifetime of the probe.
-        let ds = DetectionStream()
-        self.detectionStream = ds
+        // Retain the DetectionStream for the lifetime of this pipeline cycle.
         let box = Unmanaged.passRetained(ds).toOpaque()
         self.retainedBox = box
 
@@ -308,37 +529,83 @@ actor GStreamerFrameReader {
 
         let stateChange = gst_element_set_state(parsed, GST_STATE_PLAYING)
         guard stateChange != GST_STATE_CHANGE_FAILURE else {
-            cleanup()
+            // Release everything we acquired before throwing.
+            Unmanaged<DetectionStream>.fromOpaque(box).release()
+            self.retainedBox = nil
+            self.probeId = 0
+            gst_object_unref(UnsafeMutableRawPointer(tracker))
+            self.nvtrackerElement = nil
+            gst_element_set_state(parsed, GST_STATE_NULL)
+            gst_object_unref(UnsafeMutableRawPointer(parsed))
+            self.pipeline = nil
             throw GStreamerError.stateChangeFailed("PLAYING")
         }
-
-        isRunning = true
-        logger.info("DeepStream pipeline started (pure detection, no MJPEG branch)", metadata: [
-            "stream": "\(stream.name)",
-        ])
-
-        return ds.stream
     }
 
-    /// Transition the pipeline to NULL and release all GStreamer resources.
-    func stop() {
-        isRunning = false
+    /// Tear down the current pipeline cycle:
+    ///   1. Remove the pad probe.
+    ///   2. Release the retained DetectionStream box.
+    ///   3. Transition pipeline to NULL.
+    ///   4. Unref pipeline + tracker element.
+    ///
+    /// Safe to call when no pipeline is active (all fields are nil-checked).
+    /// Does NOT finish the DetectionStream — that is reserved for `stop()` /
+    /// `stopReconnecting()` which signals final shutdown.
+    private func teardownPipeline() {
+        // 1. Remove the pad probe so the streaming thread stops writing.
+        if let tracker = nvtrackerElement, probeId != 0 {
+            let pad = gst_element_get_static_pad(tracker, "src")
+            if let pad {
+                gst_pad_remove_probe(pad, probeId)
+                gst_object_unref(UnsafeMutableRawPointer(pad))
+            }
+            self.probeId = 0
+        }
 
-        detectionStream?.finish()
-        detectionStream = nil
-
+        // 2. Release the retained box (balances passRetained in startPipeline).
         if let box = retainedBox {
             Unmanaged<DetectionStream>.fromOpaque(box).release()
             retainedBox = nil
         }
 
-        cleanup()
-        logger.info("DeepStream pipeline stopped", metadata: [
-            "stream": "\(stream.name)",
-        ])
+        // 3 & 4. Transition to NULL and unref.
+        if let tracker = nvtrackerElement {
+            gst_object_unref(UnsafeMutableRawPointer(tracker))
+            self.nvtrackerElement = nil
+        }
+        if let pipeline = pipeline {
+            gst_element_set_state(pipeline, GST_STATE_NULL)
+            gst_object_unref(UnsafeMutableRawPointer(pipeline))
+            self.pipeline = nil
+        }
     }
 
-    // MARK: Private
+    /// Non-blocking bus poll. Returns a ReconnectTrigger if an EOS or ERROR
+    /// message is available, nil if the bus is clean.
+    ///
+    /// Uses wendy_gst_bus_pop_error (returns 0=none, 1=error, 2=EOS).
+    private func pollBus() -> ReconnectTrigger? {
+        guard let pipeline else { return nil }
+        var message: UnsafeMutablePointer<CChar>? = nil
+        let result = wendy_gst_bus_pop_error(pipeline, &message)
+        switch result {
+        case 1:
+            let msg: String
+            if let m = message {
+                msg = String(cString: m)
+                g_free(m)
+            } else {
+                msg = "unknown error"
+            }
+            return .error(msg)
+        case 2:
+            return .eos
+        default:
+            return nil
+        }
+    }
+
+    // MARK: Private — pipeline construction
 
     /// Build the GStreamer pipeline description string.
     ///
@@ -398,16 +665,10 @@ actor GStreamerFrameReader {
         }
     }
 
+    // cleanup() is kept for backwards compat with any internal callers.
+    // New code should call teardownPipeline() directly.
     private func cleanup() {
-        if let tracker = nvtrackerElement {
-            gst_object_unref(UnsafeMutableRawPointer(tracker))
-            self.nvtrackerElement = nil
-        }
-        if let pipeline = pipeline {
-            gst_element_set_state(pipeline, GST_STATE_NULL)
-            gst_object_unref(UnsafeMutableRawPointer(pipeline))
-            self.pipeline = nil
-        }
+        teardownPipeline()
     }
 }
 
@@ -426,9 +687,30 @@ struct GStreamerReader: Sendable {
         try await reader.start()
     }
 
-    /// Stop the underlying pipeline and finish the stream.
+    /// Start the pipeline with automatic EOS/error reconnect.
+    ///
+    /// Returns the long-lived detection stream. The caller should iterate over
+    /// it; the reconnect loop runs as a sibling Task inside the actor.
+    func startWithReconnect(
+        fpsGauge: GaugeMetric,
+        reconnectsCounter: CounterMetric,
+        onCycleStart: @escaping @Sendable () -> Void
+    ) async throws -> AsyncStream<DetectionFrame> {
+        try await reader.runWithReconnect(
+            fpsGauge: fpsGauge,
+            reconnectsCounter: reconnectsCounter,
+            onCycleStart: onCycleStart
+        )
+    }
+
+    /// Stop the underlying pipeline and finish the stream (no-reconnect mode).
     func stop() async {
         await reader.stop()
+    }
+
+    /// Stop the reconnect loop and finish the stream.
+    func stopReconnecting() async {
+        await reader.stopReconnecting()
     }
 }
 

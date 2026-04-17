@@ -11,9 +11,14 @@
 //   - Track-finalizer for VLM integration (currently disabled)
 //   - Hummingbird HTTP server on :9090 (metrics, health, detections)
 //   - Prometheus metrics (Metrics.swift)
+//
+// Reconnect: runStreamDetectionLoop now uses GStreamerReader.startWithReconnect()
+// to automatically recover from upstream EOS or pipeline errors. The
+// DetectionStream is long-lived; WebSocket subscribers are not dropped on reconnect.
 
 import ArgumentParser
 import Logging
+import Synchronization
 
 #if canImport(Glibc)
     import Glibc
@@ -117,6 +122,18 @@ struct Detector: AsyncParsableCommand {
     }
 }
 
+// MARK: - FPS window state
+
+/// Small Mutex-protected struct that holds per-frame FPS accounting vars.
+///
+/// Placed behind a Mutex so the `onCycleStart` closure (called from the
+/// actor's reconnect Task) can safely reset the window while the detection
+/// loop reads it on each frame — without an actor hop.
+private struct FPSWindow: Sendable {
+    var frameCount: UInt64 = 0
+    var windowStart: ContinuousClock.Instant = ContinuousClock.now
+}
+
 // MARK: - Per-stream detection loop
 
 private func runStreamDetectionLoop(
@@ -128,7 +145,9 @@ private func runStreamDetectionLoop(
     var logger = logger
     logger[metadataKey: "stream"] = "\(stream.name)"
 
+    // Metric handles — registered once, reused across reconnect cycles.
     let fps = fpsGauge(stream: stream.name)
+    let reconnects = reconnectsTotalCounter(stream: stream.name)
     let framesProcessed = framesProcessedCounter(stream: stream.name)
     let activeTracks = activeTracksGauge(stream: stream.name)
     let totalLatency = totalLatencyHistogram(stream: stream.name)
@@ -137,20 +156,38 @@ private func runStreamDetectionLoop(
     let inferenceLatency = inferenceLatencyHistogram(stream: stream.name)
     let preprocessLatency = preprocessLatencyHistogram(stream: stream.name)
     let postprocessLatency = postprocessLatencyHistogram(stream: stream.name)
+
+    // Class-detection counter cache — accumulates across reconnect cycles.
     var classCounterCache: [String: CounterMetric] = [:]
-    var frameCount: UInt64 = 0
-    var fpsWindowStart = ContinuousClock.now
     var previousTrackerIds = Set<Int>()
+
+    // FPS window state behind a Mutex so the onCycleStart closure can reset
+    // it safely from the actor's reconnect Task (different concurrency domain).
+    let fpsWindow = Mutex(FPSWindow())
 
     let reader = GStreamerReader(stream: stream)
 
-    logger.info("Starting DeepStream detection loop")
+    logger.info("Starting DeepStream detection loop (with reconnect)")
 
     do {
-        let detectionStream = try await reader.start()
+        // onCycleStart is called at the beginning of every pipeline cycle
+        // (including the first). It resets FPS window state so the gauge
+        // does not report stale values during a reconnect.
+        let detectionStream = try await reader.startWithReconnect(
+            fpsGauge: fps,
+            reconnectsCounter: reconnects,
+            onCycleStart: {
+                fpsWindow.withLock { w in
+                    w.frameCount = 0
+                    w.windowStart = ContinuousClock.now
+                }
+            }
+        )
 
         // Detection loop: sole consumer of detectionStream.
-        // broadcaster.distribute(frame) is called inline — no secondary consumer.
+        // The loop runs for the lifetime of the process; the reconnect logic
+        // inside GStreamerReader rebuilds the pipeline without finishing this
+        // AsyncStream, so the for-await loop never exits on a reconnect.
         for await frame in detectionStream {
             let detections = frame.detections
             let currentTrackerIds = Set(detections.compactMap(\.trackId))
@@ -164,7 +201,6 @@ private func runStreamDetectionLoop(
             // drop stale frames via per-client AsyncStream bufferingNewest(4)).
             await broadcaster.distribute(frame)
 
-            frameCount += 1
             framesProcessed.inc()
 
             // Per-frame gauges + histograms.
@@ -174,23 +210,13 @@ private func runStreamDetectionLoop(
             }
 
             // DeepStream component latency histograms.
-            // These are non-zero only when NVDS_ENABLE_COMPONENT_LATENCY_MEASUREMENT=1.
+            // Non-zero only when NVDS_ENABLE_COMPONENT_LATENCY_MEASUREMENT=1.
             let t = frame.timing
-            if t.decodeMs > 0 {
-                decodeLatency.observe(t.decodeMs)
-            }
-            if t.streammuxMs > 0 {
-                streammuxLatency.observe(t.streammuxMs)
-            }
-            if t.inferenceMs > 0 {
-                inferenceLatency.observe(t.inferenceMs)
-            }
-            if t.preprocessMs > 0 {
-                preprocessLatency.observe(t.preprocessMs)
-            }
-            if t.postprocessMs > 0 {
-                postprocessLatency.observe(t.postprocessMs)
-            }
+            if t.decodeMs > 0 { decodeLatency.observe(t.decodeMs) }
+            if t.streammuxMs > 0 { streammuxLatency.observe(t.streammuxMs) }
+            if t.inferenceMs > 0 { inferenceLatency.observe(t.inferenceMs) }
+            if t.preprocessMs > 0 { preprocessLatency.observe(t.preprocessMs) }
+            if t.postprocessMs > 0 { postprocessLatency.observe(t.postprocessMs) }
 
             var classCounts: [Int: Int] = [:]
             for det in detections {
@@ -209,12 +235,17 @@ private func runStreamDetectionLoop(
                 counter.inc(by: Double(count))
             }
 
-            let now = ContinuousClock.now
-            let elapsedSeconds = durationSeconds(now - fpsWindowStart)
-            if elapsedSeconds >= 1.0 {
-                fps.set(Double(frameCount) / elapsedSeconds)
-                frameCount = 0
-                fpsWindowStart = now
+            // FPS window accounting — read+write under Mutex so onCycleStart
+            // can safely reset from a concurrent context.
+            fpsWindow.withLock { w in
+                w.frameCount += 1
+                let now = ContinuousClock.now
+                let elapsed = durationSeconds(now - w.windowStart)
+                if elapsed >= 1.0 {
+                    fps.set(Double(w.frameCount) / elapsed)
+                    w.frameCount = 0
+                    w.windowStart = now
+                }
             }
         }
 
@@ -224,7 +255,7 @@ private func runStreamDetectionLoop(
 
     logger.warning("Detection loop ended for stream \(stream.name)")
     await broadcaster.stop()
-    await reader.stop()
+    await reader.stopReconnecting()
 }
 
 private func durationSeconds(_ d: Duration) -> Double {
