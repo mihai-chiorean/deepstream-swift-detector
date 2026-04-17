@@ -188,7 +188,6 @@ What's still open, in the order I'd pick them up:
 
 - **Multi-stream scaling curve.** Swift vs Python under K ∈ {1, 2, 4, 6, 8} streams against synthetic sources. Does Python's GIL-capped pad-probe plateau earlier than Swift's C shim? That's the question the single-stream 1.93× ratio can't quite answer on its own.
 - **NvSORT tracker swap.** NvDCF's appearance features are wasted on objects that move smoothly through the frame for 1–2 seconds and rarely occlude; NvSORT is the cheaper Kalman-only tracker that needs no pixel data. Hours of config and revalidation.
-- **`rtspsrc` auto-reconnect.** The current detector sits idle forever after an upstream EOS. Bus watch + teardown-and-rebuild, straightforward Swift work.
 - **A sharper reliability audit.** Quantify post-port uptime properly with a stress-harness (periodic relay drops, camera teardowns) rather than the opportunistic numbers I have today.
 
 Bet: paid.
