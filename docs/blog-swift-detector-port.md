@@ -106,7 +106,7 @@ That's the whole boundary. Swift code touches zero NVMM. Detection data crosses 
 
 Same FPS as before — 20 on the same 1080p RTSP source, which is what the camera delivers (both the old and new pipeline are source-limited, not compute-limited, at this input). The leak canary on `/sys/kernel/debug/nvmap/iovmm/allocations` is flat after warmup, where the old version had it climbing 65 MB → 3.1 GB in 30 seconds. RSS plateaus well under the 5 GiB cgroup cap and stays there across multi-hour soak runs, vs. the old behavior of OOM in single-digit minutes. Less code, no leak.
 
-A caveat on the "flat" part, since I've since measured it more carefully: nvmap sits at ~206 MB steady-state under the current pipeline (Stage 2, MJPEG branch removed — see below). Earlier sub-versions had it at ~224 MB; the ~20 MB drop is from removing `nvjpegenc` + `nvdsosd` surfaces, not from any change in the source path. Direct camera and `mediamtx` relay paths both land in the same band; an earlier "the relay quadruples the baseline" reading I had was a measurement artifact, refuted by an A/B. Four minutes is too short to rule out slower growth; the original "no leak" confidence comes from the multi-hour soaks I ran earlier on the direct-camera path, not from a single benchmark. The head-to-head comparison against the Python original now has real data: a 300s concurrent run on the same relay stream with both detectors stable shows them processing 6,349 vs 6,350 frames over the window — effectively identical throughput at ~21 FPS each, with shared nvmap flat at 421 MB. Per-process VmRSS comes out at 797 MB (Python) vs 676 MB (Swift); both flat over the window. An earlier concurrent run had Python crashing partway through and Swift falling to 0.24 FPS, which I framed as VIC NVDEC contention; that framing is wrong and the current data supersedes it. The leak story in this post is solid either way — "leak vs. no leak" at 65 MB/s is not a close call.
+A caveat on the "flat" part, since I've since measured it more carefully: nvmap sits at ~206 MB steady-state under the current pipeline (Stage 2, MJPEG branch removed — see below). Earlier sub-versions had it at ~224 MB; the ~20 MB drop is from removing `nvjpegenc` + `nvdsosd` surfaces, not from any change in the source path. Direct camera and `mediamtx` relay paths both land in the same band; an earlier "the relay quadruples the baseline" reading I had was a measurement artifact, refuted by an A/B. Four minutes is too short to rule out slower growth; the original "no leak" confidence comes from the multi-hour soaks I ran earlier on the direct-camera path, not from a single benchmark. The head-to-head comparison against the Python original now has real data: a 300s concurrent run on the same relay stream with both detectors stable shows them processing 6,349 vs 6,350 frames over the window — effectively identical throughput at ~21 FPS each, with shared nvmap flat at 421 MB. Per-process VmRSS comes out at 797 MB (Python) vs 676 MB (Swift); both flat over the window. A separate 5-minute per-process CPU sample lands at 26.6% of one core for Swift and 52.1% for Python — a 1.96× ratio, reproduced at 1.93× after a later config change. Same fps, same NVIDIA stack downstream; the gap lives entirely in the host process. An earlier concurrent run had Python crashing partway through and Swift falling to 0.24 FPS, which I framed as VIC NVDEC contention; that framing is wrong and the current data supersedes it. The leak story in this post is solid either way — "leak vs. no leak" at 65 MB/s is not a close call.
 
 ## The slog (because it was real)
 
@@ -144,3 +144,51 @@ So the `tee` is gone. `nvdsosd`, `nvjpegenc`, `nvvideoconvert`, the valve, the v
 The bounding boxes still render. Stage 1 added a `requestVideoFrameCallback` loop that matches each presented video frame against a ring buffer of detection messages using `ptsNs` — the buffer's GStreamer PTS, propagated through the C shim and into the WebSocket JSON. When the browser gets a video frame callback with `metadata.mediaTime`, it converts that to nanoseconds, computes a calibrated offset from the first 8 frames, and picks the detection whose `ptsNs` is closest to the estimated playback PTS. The boxes are matched to the presented frame rather than trailing by the WebSocket delivery latency — on Chrome, where requestVideoFrameCallback is available.
 
 The lesson I didn't see clearly enough the first time: the MJPEG sidecar was still me trying to do NVIDIA's job. The video was already in the RTSP relay. The detector doesn't need to know about it. The final architecture removed the MJPEG branch entirely because once you have an RTSP relay already in the stack, the cheapest encoder is no encoder.
+
+---
+
+## Postscript: what the numbers actually said
+
+Between the Stage 2 deletion and this post going up, I ran a few more things.
+
+**Python vs Swift under concurrent load.** 300 s window, both detectors against the same mediamtx relay, same YOLO26n FP16 engine, same custom parser, same NvDCF tracker. Identical throughput — 21.17 vs 21.16 FPS, 6,350 vs 6,349 frames. Shared `nvmap` bit-exact at 421,520 kB across the whole window. Per-process VmRSS Swift 676 MB vs Python 797 MB; both flat. An earlier inconclusive run had Python crashing partway through and I framed the result as VIC NVDEC contention — that framing was wrong, the real story is "same pipeline, same throughput." Not a surprise: the accelerator stages downstream of the pad probe are identical bytes in both containers.
+
+**The one number that actually lives in the host process.** A separate 5-minute per-process CPU sample: Swift at **26.6% of one core**, Python at **52.1%**. A 1.96× ratio, reproduced at 1.93× after a later config change. Same FPS, same NVIDIA stack downstream, same custom parser — the gap is the probe callback. pyds walks `NvDsObjectMeta` via pybind11 under the GIL, with a `Counter.inc()` per detection, plus `defaultdict` updates and `Histogram.observe`. The Swift C shim flattens the same structs in under 100 µs, GIL-free. That's the clean language-layer signal the rest of the benchmark can't quite carry alone. What I haven't measured yet is what this curve looks like under K parallel streams, where a GIL-capped probe thread would plateau and the C-shim wouldn't. That experiment would either load-bear the scaling claim or refute it.
+
+**A class filter that wasn't a perf win.** YOLO26 emits 80 COCO classes. The tracker was maintaining probationary tracks for every detection the model produced, including the couches and toasters YOLO occasionally hallucinates. Research said the knob was `operate-on-class-ids` on `nvtracker`. On DeepStream 7.1 that property doesn't exist; `gst-inspect-1.0 nvtracker` is authoritative and the docs I'd been reading were not. The right layer is `filter-out-class-ids` on `nvinfer`, which drops unwanted classes from metadata before they reach the tracker at all. One-line property per detector.
+
+What it didn't do was move CPU: Swift went 26.6 → 27.8, Python 52.1 → 53.8 — inside tick-to-tick noise. YOLO26 wasn't producing many false positives in the dropped classes on this suburban-cars-and-dogs footage, so the tracker had nothing to save work on. The filter is correctness, not perf. Worth shipping anyway — the tracker shouldn't be paying probation cost for objects the application will never care about, even if today that cost is hidden.
+
+**Sub-frame overlay alignment.** Stage 2's browser matched each presented WebRTC frame to a detection ring buffer by `ptsNs`, with a calibration offset derived from `video.mediaTime`. `mediaTime` is the playback clock — when the browser adjusts rate to compensate for jitter, it drifts against the source clock, and the overlay drifts with it.
+
+The fix was `requestVideoFrameCallback`'s `metadata.rtpTimestamp` — the 90 kHz integer the encoder stamped on the RTP packet. Same clock domain on both ends. One calibration sample captures the offset; after that matching is unsigned-32 integer arithmetic with wraparound handling. Sub-frame residual.
+
+The prettier version is **SEI in H.264** — detection JSON as `user_data_unregistered` NAL units inside the bitstream, pixel-perfect by construction. But `<video>` decodes and discards SEI; to read it you route the stream through WebCodecs (`VideoDecoder`) with your own JS H.264 Annex-B parser, lose `<video>`'s autoplay/controls/fullscreen, and accept that Firefox stable doesn't have WebCodecs. Days of work for precision that's already below the perceptual threshold at 21 FPS.
+
+And the WebRTC **DataChannel** version — detections on a data channel alongside the video track — isn't feasible with mediamtx. It's media-only; SCTP data channels for custom payloads aren't exposed. Either patch mediamtx (Go work I'm not doing) or run a separate Swift WebRTC server next to it (days). Both paths' alignment win comes from rtpTimestamp matching, which I can get over the existing WebSocket transport.
+
+So the final move was the lightweight one: keep the WebSocket, swap the matching key. A/B-able from a URL hash (`#lead=rtp`), falls through to the mediaTime path where `rtpTimestamp` isn't populated.
+
+## What Swift actually built
+
+NVIDIA built the detection — NVDEC, TensorRT, NvDCF, `nvinfer`, `nvtracker`, `nvdsosd`. Swift built the orchestration: zero buffer-map, typed `DetectionFrame` metadata, `AsyncStream`-shaped flow into Hummingbird + WebSocket fan-out, stable RSS, the CDI bind-mount plumbing that lets a 181 MiB image inherit a full DeepStream runtime at task start. The detection robustness in this stack is NVIDIA's. The robustness Swift contributed is for the host process: doesn't leak, doesn't crash, doesn't hang on the pad probe, doesn't need a CUDA context to stay alive.
+
+That's the useful and achievable version of "production-ready Swift on Jetson."
+
+## The bet
+
+I started this because of a bet. Three years ago at a Swift meetup I made the case that Swift could do real embedded work — not iOS, not a Mac app, but production edge ML on the kind of NVIDIA hardware most of the industry writes in C++ or Python. I did the talk. I never published the recording — part of me wanted to ship something concrete before I did.
+
+This is the something concrete.
+
+- Talk recording: `[placeholder]`
+- Repo: `[placeholder]`
+
+What's still open, in the order I'd pick them up:
+
+- **Multi-stream scaling curve.** Swift vs Python under K ∈ {1, 2, 4, 6, 8} streams against synthetic sources. Does Python's GIL-capped pad-probe plateau earlier than Swift's C shim? That's the question the single-stream 1.93× ratio can't quite answer on its own.
+- **NvSORT tracker swap.** NvDCF's appearance features are wasted on objects that move smoothly through the frame for 1–2 seconds and rarely occlude; NvSORT is the cheaper Kalman-only tracker that needs no pixel data. Hours of config and revalidation.
+- **`rtspsrc` auto-reconnect.** The current detector sits idle forever after an upstream EOS. Bus watch + teardown-and-rebuild, straightforward Swift work.
+- **A sharper reliability audit.** Quantify post-port uptime properly with a stress-harness (periodic relay drops, camera teardowns) rather than the opportunistic numbers I have today.
+
+Bet: paid.
