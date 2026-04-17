@@ -417,6 +417,19 @@ func framesProcessedCounter(stream: String) -> CounterMetric {
     )
 }
 
+/// Total pipeline reconnect cycles, per stream.
+///
+/// Incremented each time the detector recovers from an upstream EOS or
+/// pipeline error. Monotonically increasing; use Prometheus rate() to
+/// detect active reconnect storms.
+func reconnectsTotalCounter(stream: String) -> CounterMetric {
+    metrics.counter(
+        "deepstream_reconnects_total",
+        help: "Total pipeline reconnect cycles triggered by upstream EOS or error",
+        labels: ["stream": stream]
+    )
+}
+
 // MARK: Histogram metrics
 
 /// nvstreammux latency in milliseconds (buffer batching), per stream.
