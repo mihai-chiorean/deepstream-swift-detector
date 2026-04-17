@@ -626,7 +626,13 @@
         //   #lead=none       playoutDelayHint=0.15, subtract 50 ms from ptsOffsetNs post-calibration
         //   #lead=low        playoutDelayHint=0.10, no ptsOffset shift
         //   #lead=offset-only  playoutDelayHint=0,  subtract 50 ms from ptsOffsetNs post-calibration
-        const LEAD_MODES = ['none', 'low', 'offset-only'];
+        //   #lead=rtp        same-clock-domain matching: use RVFC metadata.rtpTimestamp (90 kHz)
+        //                    instead of mediaTime (seconds). The RTP timestamp on each presented
+        //                    frame is the encoder-stamped value from the RTP packet, so it does
+        //                    not drift when the browser adjusts playback rate for jitter
+        //                    compensation. Calibration captures the offset once; subsequent
+        //                    matches are integer arithmetic in 90 kHz.
+        const LEAD_MODES = ['none', 'low', 'offset-only', 'rtp'];
         const _hashMode  = window.location.hash.replace('#lead=', '').replace('#', '');
         const leadMode   = LEAD_MODES.includes(_hashMode) ? _hashMode : 'default';
 
@@ -900,6 +906,13 @@
         let ptsOffsetNs = 0;        // running average after calibration
         let ptsCalibrated = false;
 
+        // RTP-clock calibration (used only when leadMode === 'rtp'). Same shape as
+        // ptsOffset but in 90 kHz RTP units instead of nanoseconds.
+        // rtpOffset = metadata.rtpTimestamp - (ptsNs * 90 / 1e6)  (mod 2^32 considered)
+        let rtpOffsetSamples = [];
+        let rtpOffset90k = 0;
+        let rtpCalibrated = false;
+
         // COCO class colours for bounding boxes.
         const CLASS_COLORS = [
             '#ef4444',  // 0: person
@@ -1045,36 +1058,74 @@
             const mediaTimeNs = metadata.mediaTime * 1e9;
             document.getElementById('dp-mt').textContent = metadata.mediaTime.toFixed(3) + 's';
 
-            const estimatedPtsNs = ptsCalibrated ? mediaTimeNs - ptsOffsetNs : mediaTimeNs;
-
-            // Find the detection in the ring whose ptsNs is closest to estimated.
+            // ---- RTP-clock matching path (lead=rtp) ----
+            // Use metadata.rtpTimestamp (90 kHz, integer, encoder-stamped on the RTP
+            // packet) instead of mediaTime. Same calibration shape, different clock.
+            // Falls through to mediaTime path if rtpTimestamp is unavailable on this
+            // browser/track (Firefox has no RVFC at all; Chrome populates it for
+            // remote tracks).
             let bestEntry = null;
             let bestDelta = Infinity;
-            for (const entry of detectionRing) {
-                if (entry.ptsNs < 0) continue;  // no PTS — skip for calibration
-                const delta = Math.abs(entry.ptsNs - estimatedPtsNs);
-                if (delta < bestDelta) {
-                    bestDelta = delta;
-                    bestEntry = entry;
-                }
-            }
+            const rtpTs = metadata.rtpTimestamp;
+            const useRtp = (leadMode === 'rtp' && typeof rtpTs === 'number');
 
-            // Calibrate offset using the first CALIBRATION_FRAMES frames with a valid hit.
-            if (!ptsCalibrated && bestEntry && bestEntry.ptsNs > 0) {
-                ptsOffsetSamples.push(mediaTimeNs - bestEntry.ptsNs);
-                if (ptsOffsetSamples.length >= CALIBRATION_FRAMES) {
-                    const sum = ptsOffsetSamples.reduce((a, b) => a + b, 0);
-                    ptsOffsetNs = sum / ptsOffsetSamples.length;
-                    ptsCalibrated = true;
-                    // For modes 'none' and 'offset-only': shift the offset back by 50 ms
-                    // to compensate for NvDCF tracker Kalman forward-prediction (~1 frame).
-                    if (leadMode === 'none' || leadMode === 'offset-only') {
-                        ptsOffsetNs -= 50_000_000;  // 50 ms in nanoseconds
-                        log(`ptsOffsetNs adjusted -50 ms for lead=${leadMode}: now ${(ptsOffsetNs / 1e6).toFixed(1)} ms`, 'info');
+            if (useRtp) {
+                // Convert each detection's ptsNs to 90 kHz RTP units; match by smallest
+                // unsigned-32 distance (handles RTP wraparound at 2^32).
+                const wrap = 4294967296;  // 2^32
+                const halfWrap = 2147483648;  // 2^31
+                const estPtsRtp = rtpCalibrated ? ((rtpTs - rtpOffset90k) >>> 0) : rtpTs;
+                for (const entry of detectionRing) {
+                    if (entry.ptsNs < 0) continue;
+                    const ptsRtp = Math.round(entry.ptsNs * 90 / 1e6) >>> 0;
+                    let d = Math.abs(ptsRtp - estPtsRtp);
+                    if (d > halfWrap) d = wrap - d;
+                    if (d < bestDelta) {
+                        bestDelta = d;
+                        bestEntry = entry;
                     }
-                    log(`PTS offset calibrated: ${(ptsOffsetNs / 1e6).toFixed(1)} ms`, 'success');
-                    console.log('[overlay] PTS offset calibrated:', ptsOffsetNs, 'ns =',
-                        (ptsOffsetNs / 1e6).toFixed(1), 'ms');
+                }
+
+                if (!rtpCalibrated && bestEntry && bestEntry.ptsNs > 0) {
+                    const ptsRtp = Math.round(bestEntry.ptsNs * 90 / 1e6) >>> 0;
+                    rtpOffsetSamples.push((rtpTs - ptsRtp) >>> 0);
+                    if (rtpOffsetSamples.length >= CALIBRATION_FRAMES) {
+                        // Median is more robust than mean across wraparound; sort and pick.
+                        const sorted = [...rtpOffsetSamples].sort((a, b) => a - b);
+                        rtpOffset90k = sorted[sorted.length >> 1];
+                        rtpCalibrated = true;
+                        log(`RTP offset calibrated: ${rtpOffset90k} (90 kHz ticks ≈ ${(rtpOffset90k / 90).toFixed(1)} ms)`, 'success');
+                        console.log('[overlay] RTP offset calibrated:', rtpOffset90k);
+                    }
+                }
+            } else {
+                // ---- Default mediaTime-based matching path ----
+                const estimatedPtsNs = ptsCalibrated ? mediaTimeNs - ptsOffsetNs : mediaTimeNs;
+                for (const entry of detectionRing) {
+                    if (entry.ptsNs < 0) continue;
+                    const delta = Math.abs(entry.ptsNs - estimatedPtsNs);
+                    if (delta < bestDelta) {
+                        bestDelta = delta;
+                        bestEntry = entry;
+                    }
+                }
+
+                if (!ptsCalibrated && bestEntry && bestEntry.ptsNs > 0) {
+                    ptsOffsetSamples.push(mediaTimeNs - bestEntry.ptsNs);
+                    if (ptsOffsetSamples.length >= CALIBRATION_FRAMES) {
+                        const sum = ptsOffsetSamples.reduce((a, b) => a + b, 0);
+                        ptsOffsetNs = sum / ptsOffsetSamples.length;
+                        ptsCalibrated = true;
+                        // For modes 'none' and 'offset-only': shift the offset back by 50 ms
+                        // to compensate for NvDCF tracker Kalman forward-prediction (~1 frame).
+                        if (leadMode === 'none' || leadMode === 'offset-only') {
+                            ptsOffsetNs -= 50_000_000;  // 50 ms in nanoseconds
+                            log(`ptsOffsetNs adjusted -50 ms for lead=${leadMode}: now ${(ptsOffsetNs / 1e6).toFixed(1)} ms`, 'info');
+                        }
+                        log(`PTS offset calibrated: ${(ptsOffsetNs / 1e6).toFixed(1)} ms`, 'success');
+                        console.log('[overlay] PTS offset calibrated:', ptsOffsetNs, 'ns =',
+                            (ptsOffsetNs / 1e6).toFixed(1), 'ms');
+                    }
                 }
             }
 
