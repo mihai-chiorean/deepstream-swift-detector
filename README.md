@@ -2,6 +2,8 @@
 
 Real-time object detection and scene understanding on Jetson devices using DeepStream and vision language models.
 
+> Originally developed inside [`wendylabsinc/samples`](https://github.com/wendylabsinc/samples) under `samples/deepstream-vision/`. This repository is the standalone extract — full history preserved via `git subtree split` — kept as a focused reference implementation alongside the blog post on Swift + DeepStream on Jetson Orin Nano.
+
 ## What This Does
 
 - **YOLO Detection**: Runs YOLO11n at 20+ FPS on Jetson Orin
