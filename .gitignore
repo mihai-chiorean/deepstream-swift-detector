@@ -6,3 +6,13 @@ models/
 
 # Local Claude skills and context
 .claude/
+
+# Session-private docs — live in the upstream samples repo / author's working
+# tree, intentionally not published here. See git tag pre-cleanup-20260420 if
+# you need to recover the pre-cleanup history.
+docs/HANDOFF.md
+docs/blog-swift-detector-port.md
+docs/blog-angle-proposal.md
+docs/reliability-audit.md
+docs/billboard-scanner-design.md
+detector-swift/PORT_PLAN.md
