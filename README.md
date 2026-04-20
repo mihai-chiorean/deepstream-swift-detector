@@ -1,196 +1,120 @@
-# DeepStream Vision
+# DeepStream Swift Detector
 
-Real-time object detection and scene understanding on Jetson devices using DeepStream and vision language models.
+A Swift port of an NVIDIA DeepStream object-detection pipeline, running on a Jetson Orin Nano 8 GB. Swift orchestrates a GStreamer graph — `rtspsrc → nvv4l2decoder → nvstreammux → nvinfer → nvtracker → fakesink` — reads inference metadata off a pad probe, and serves it as a typed `AsyncStream<DetectionFrame>` into an HTTP + WebSocket surface. Pixels stay on the GPU; Swift never touches an NVMM surface.
 
-> Originally developed inside [`wendylabsinc/samples`](https://github.com/wendylabsinc/samples) under `samples/deepstream-vision/`. This repository is the standalone extract — full history preserved via `git subtree split` — kept as a focused reference implementation alongside the blog post on Swift + DeepStream on Jetson Orin Nano.
+> **Blog post with the full story:** [*Swift doing NVIDIA's job, twice*](https://mihaichiorean.com/blog/swift-doing-nvidias-job/) — the two architectural mistakes that shaped this pipeline, with measurements and the deletion-over-refactor pattern.
+>
+> **Python sibling + upstream context:** the Python version of this detector, plus broader WendyOS sample projects, live in [`wendylabsinc/samples`](https://github.com/wendylabsinc/samples) under `samples/deepstream-vision/`. This repo is a standalone extract focused on the Swift port, with full commit history preserved via `git subtree split`.
 
-## What This Does
+---
 
-- **YOLO Detection**: Runs YOLO11n at 20+ FPS on Jetson Orin
-- **VLM Descriptions**: Optional AI scene descriptions using Qwen3-VL
-- **Live Dashboard**: Web UI showing detections, metrics, and video stream
-- **Prometheus Metrics**: FPS, latency, detection counts for monitoring
+## What this actually is
 
-## Prerequisites
+- **`detector-swift/`** — the Swift detector. ~150 lines of Swift orchestrating GStreamer, plus a small C shim in `Sources/CGStreamer/nvds_shim.c` that walks DeepStream's `NvDsBatchMeta` linked lists and flattens them into POD structs Swift consumes.
+- **`detector/`** — the Python sibling, kept for head-to-head comparison. Same TensorRT engine, same custom bbox parser, same tracker — different host process.
+- **`monitor.html`** + **`monitor_proxy.py`** — a browser monitor that pulls video from `mediamtx` over WebRTC and overlays bounding boxes from the detector's WebSocket stream, synchronized via `requestVideoFrameCallback`'s `metadata.rtpTimestamp`.
+- **`docs/`** — technical reference material: benchmarks (Run 1–3 head-to-head), CPU scaling analysis, tracker and transport research, mediamtx RTSP relay config, MJPEG-decoupling notes.
+- **`gpu-stats/`**, **`vlm/`** — sidecar components (tegrastats exporter; Qwen3-VL inference server). Not required to run the detector; see upstream `wendylabsinc/samples` for their full context.
 
-1. **Wendy CLI** installed on your Mac
-2. **Jetson device** running WendyOS (Orin recommended)
-3. **RTSP camera** or video source
-4. **Hugging Face account** (for VLM, optional)
+---
 
-## Quick Start
+## Test environment
 
-### 1. Connect to Your Device
+These caveats matter if you want to reproduce the results:
 
-First, make sure your Jetson is connected to WiFi:
+- **Hardware:** Jetson Orin Nano 8 GB developer kit.
+- **JetPack:** **r36.4.4**. The DeepStream + GStreamer plugin chain is sensitive to JetPack minor versions; behavior on newer releases is not verified by this repo.
+- **DeepStream:** 7.1 (the version that ships with JetPack r36.4.4 / L4T r36.4.4).
+- **Host OS on the device:** [WendyOS](https://github.com/wendylabsinc/wendyos), a Yocto-based edge Linux distribution. WendyOS is in active development — its image builds, runtime libs, and CDI specs change between releases. If you're running on a different build than ours, expect to re-do some of the plumbing described below.
+- **Inference model:** YOLO26n FP16 compiled to a TensorRT engine with a custom bbox parser (`libnvdsparsebbox_yolo26.so`). See `detector-swift/Dockerfile` for how the parser .so is built against DeepStream 7.1 headers.
+
+### OS plumbing that wasn't turnkey
+
+Getting Swift to drive DeepStream 7.1 on JetPack r36.4.4 required two pieces of plumbing on the OS side beyond what was turnkey in the original WendyOS build we started from:
+
+- **CDI spec extensions.** Containerd on WendyOS uses a [CDI (Container Device Interface)](https://github.com/cncf-tags/container-device-interface) spec to bind-mount NVIDIA runtime libraries into containers at task start. The stock CDI spec did not bind-mount everything DeepStream 7.1 needs (`libnvv4l2.so`, `libv4l2_nvvideocodec.so`, `libtegrav4l2.so`, the full gst-plugins-bad chain, and several device nodes for NVDEC). We extended the CDI spec — and added a post-processing script to patch environment variables like `LIBV4L2_PLUGIN_DIR` that `nvidia-ctk` silently drops from CSV input — so that a minimal `ubuntu:24.04`-based container can inherit a working NVDEC + nvinfer + NvDCF pipeline at runtime. See `detector-swift/ARCHITECTURE.md` for the concrete list of bind-mounts.
+- **A more complete Swift cross-compile SDK.** WendyOS ships a Swift SDK for aarch64, but DeepStream's C headers (`nvdsmeta.h`, `nvll_osd_struct.h`, etc.) and linker stubs for the DeepStream libs were missing. We extended the Yocto `deepstream-7.1` recipe to copy those headers into the SDK's `/usr/include/` and put linker-only stub `.so` files at `/usr/lib/`, then rebuilt the SDK image. The recipe change itself lives upstream in [`wendylabsinc/meta-wendyos-jetson`](https://github.com/wendylabsinc/meta-wendyos-jetson).
+
+The point: if you're coming from a vanilla JetPack install or a different container runtime, the pipeline itself is standard DeepStream 7.1 — but expect to do equivalent plumbing to make everything reachable from inside your container and from a Swift cross-compile toolchain.
+
+---
+
+## Running it
+
+### Prerequisites
+
+- Jetson Orin Nano (or similar) running JetPack r36.4.4 with DeepStream 7.1 installed.
+- A 1080p RTSP camera. The detector is currently configured for a single stream; multi-stream support is an open item (see the blog post's footer).
+- Swift 6.2+ toolchain for cross-compilation on your build host (x86_64 Linux recommended).
+
+### Build
+
+The Dockerfile in `detector-swift/` builds an aarch64 container image from a pre-compiled Swift binary:
 
 ```bash
-# Find your device
-wendy device list
-
-# Connect to WiFi (if needed)
-wendy device wifi connect --device <your-device>.local --ssid "YourWiFi" --password "YourPassword"
-
-# Verify connectivity
-ping <your-device>.local
-ssh root@<your-device>.local
+cd detector-swift
+source ~/.local/share/swiftly/env.sh     # or however you have Swift on PATH
+swift build --swift-sdk <your-aarch64-sdk> -c release
+docker buildx build --platform linux/arm64 -t detector-swift:latest .
 ```
 
-### 2. Configure Your Camera
+### Deploy
 
-Edit `detector/streams.json` with your RTSP camera URL:
+The `wendy.json` descriptors in `detector-swift/`, `detector/`, `gpu-stats/`, and `vlm/` are for the Wendy CLI (the deploy tool that ships with WendyOS). A typical deploy is:
+
+```bash
+WENDY_AGENT=<device-ip> wendy run -y --detach
+```
+
+If you're not on WendyOS, the container images are standard OCI and can be run via `ctr`, `nerdctl`, or `docker` directly — you'll need to supply the CDI spec (or mount the NVIDIA libs manually) and set `oom_score_adj` / memory cgroup caps by hand. See `OPERATIONS.md` for the adaptation notes.
+
+### Configure
+
+Edit `detector-swift/streams.json`:
 
 ```json
 {
   "streams": [
     {
       "name": "camera1",
-      "url": "rtsp://192.168.1.100:554/stream",
+      "url": "rtsp://<your-camera>/stream",
       "enabled": true
     }
   ]
 }
 ```
 
-### 3. Deploy Everything
+If you want to use the `mediamtx` RTSP relay (recommended for single-session cameras), point the detector at `rtsp://<host>:8554/<path>` and configure mediamtx per `docs/rtsp-relay.md`.
 
-```bash
-cd Examples/DeepStreamVision
-./start.sh <your-device>.local
-```
+### Observe
 
-This deploys all services in parallel:
-- **detector** - YOLO object detection (port 9090)
-- **gpu-stats** - GPU monitoring (port 9091)
-- **vlm** - Vision language model (port 8090, optional)
+- **Detector metrics** (Prometheus): `http://<device>:9090/metrics` — `deepstream_fps`, `deepstream_reconnects_total`, `deepstream_frames_processed_total`, latency histograms.
+- **Detection stream** (WebSocket): `ws://<device>:9090/detections`.
+- **Browser monitor:** `monitor_proxy.py` serves `monitor.html` with a same-origin proxy to the detector and the mediamtx WebRTC endpoint. Run it from a LAN host that can reach both the device and the browser.
 
-### 4. View the Dashboard
+---
 
-Open `monitor.html` in your browser and enter your device hostname (e.g. `<your-device>.local`):
+## What's documented in `docs/`
 
-```bash
-open monitor.html
-```
+The blog post covers the *what* and *why*. The `docs/` directory covers the *how* and the supporting measurements:
 
-The dashboard connects directly to the device services via CORS. You can also access them individually:
-- Metrics: `http://<your-device>.local:9090/metrics`
-- Stream: `http://<your-device>.local:9090/stream`
+- **`docs/benchmark-python-vs-swift.md`** — head-to-head Run 1 / Run 2 / Run 3 report. Run 2 is SUPERSEDED; the Caveats section is required reading before citing any number.
+- **`docs/cpu-scaling-research.md`** — where CPU goes element-by-element, plus the unmeasured multi-stream experiment design (GIL-bound pyds probe vs Swift C-shim).
+- **`docs/tracker-and-transport-research.md`** — NvDCF tuning knobs, class filter location (it's on `nvinfer`, not `nvtracker`, in DS 7.1), NvSORT comparison, and the SEI-vs-DataChannel-vs-WebSocket-rtpTimestamp analysis.
+- **`docs/mjpeg-contention-measurement.md`**, **`docs/mjpeg-decoupling-design.md`** — the Stage 1 → Stage 2 decision trail.
+- **`docs/rtsp-relay.md`** — mediamtx as RTSP relay. Necessary if your camera is single-session (most prosumer IP cameras are).
+- **`docs/benchmark-data/`** — raw CSVs from the measurement runs.
+- **`docs/dockerfile-nvparser-stage-example.txt`** — fragment for building `libnvdsparsebbox_yolo26.so` against DS 7.1.
 
-## Setting Up VLM (Optional)
+---
 
-The VLM service provides AI-generated descriptions of detected objects. It requires a Hugging Face token.
+## Status + caveats
 
-### Get a Hugging Face Token
+- **Current operational baseline:** ~21 FPS end-to-end, 26.6 % of one CPU core, stable RSS, `nvmap` flat at 421,520 kB, 26 h uninterrupted at the time of the blog post.
+- **Not verified on:** JetPack releases newer than r36.4.4; GPUs other than Orin Nano 8 GB; WendyOS builds other than the one this work was done on.
+- **Known to break on:** camera WiFi links with >500 ms RTT (the RTSP pull drops EOS and the detector recovers via its bus-watch reconnect loop; this was a real bug we fixed mid-flight).
+- **Open items** (see the blog post footer): multi-stream scaling curve, NvSORT tracker swap, a proper stress-harness reliability audit.
 
-1. Create account at https://huggingface.co/join
-2. Go to https://huggingface.co/settings/tokens
-3. Click "New token" → Name: `deepstream-vlm` → Type: **Read**
-4. Copy the token (starts with `hf_...`)
+## License + attribution
 
-### Configure the Token
-
-The VLM model is already bundled in the container. You just need to set the token if you want to download updates:
-
-```bash
-# Option 1: Set in Dockerfile (for permanent use)
-# Edit vlm/Dockerfile and add:
-ENV HF_TOKEN=hf_your_token_here
-
-# Option 2: Pass at runtime
-HF_TOKEN=hf_your_token_here wendy run --device <device>.local --detach
-```
-
-**Note:** The Qwen3-VL-2B-Instruct model is cached on the device, so you don't need a token for basic operation.
-
-## Services
-
-| Service | Port | Description |
-|---------|------|-------------|
-| detector | 9090 | YOLO detection, Prometheus metrics, MJPEG stream |
-| vlm | 8090 | Qwen3-VL-2B vision language model (INT4) |
-| gpu-stats | 9091 | GPU temperature, memory, utilization |
-
-## Useful Commands
-
-```bash
-# Check running apps
-wendy device apps list --device <device>.local
-
-# Stop an app
-wendy device apps stop detector --device <device>.local
-
-# View logs
-wendy device logs --device <device>.local
-wendy device logs --app detector --device <device>.local
-
-# Health checks
-curl http://<device>.local:9090/health
-curl http://<device>.local:8090/health
-
-# View metrics
-curl http://<device>.local:9090/metrics | grep deepstream_fps
-```
-
-## Troubleshooting
-
-### Device not reachable
-```bash
-# Check WiFi connection
-wendy device wifi status --device <device>.local
-
-# Reconnect WiFi
-wendy device wifi connect --device <device>.local --ssid "YourWiFi" --password "YourPassword"
-```
-
-### Detector not starting
-```bash
-# Check container status
-ssh root@<device>.local 'ctr -n default task ls'
-
-# View logs
-ssh root@<device>.local 'ctr -n default task exec detector cat /proc/1/fd/1' | tail -50
-```
-
-### VLM not responding
-- VLM takes ~10 minutes to load on first run (model quantization)
-- Subsequent starts are faster (~60 seconds)
-- Check health: `curl http://<device>.local:8090/health`
-- VLM requires ~1.5GB GPU memory (INT4 quantization)
-
-### Low FPS
-- Check GPU temperature: `ssh root@<device>.local 'cat /sys/class/thermal/thermal_zone*/temp'`
-- Reduce streams or batch size in `detector/nvinfer_config.txt`
-
-## Viewing Logs
-
-All services emit logs via OpenTelemetry to the WendyOS agent. Use the Wendy CLI to tail logs:
-
-```bash
-# All logs
-wendy device logs --device <device>.local
-
-# Filter by service
-wendy device logs --app detector --device <device>.local
-wendy device logs --app vlm --device <device>.local
-wendy device logs --app gpu-stats --device <device>.local
-```
-
-## Project Structure
-
-```
-DeepStreamVision/
-├── start.sh              # Deploy all services
-├── monitor.html          # Local dashboard (connects directly to device)
-├── detector/             # YOLO detection service
-│   ├── detector.py       # Main detection code
-│   ├── streams.json      # Camera configuration
-│   └── nvinfer_config.txt # TensorRT inference config
-├── vlm/                  # Vision language model
-│   ├── qwen3_service.py  # Qwen3-VL API server (INT4 quantized)
-│   └── models/           # Model cache directory
-└── gpu-stats/            # GPU monitoring
-```
-
-## More Documentation
-
-- [vlm/HUGGINGFACE_SETUP.md](vlm/HUGGINGFACE_SETUP.md) - HuggingFace token setup
+Originally developed inside [`wendylabsinc/samples`](https://github.com/wendylabsinc/samples). This standalone extract preserves the full commit history via `git subtree split`. The `pre-cleanup-20260420` tag on this repo points to the last commit before author-private docs were removed from the history; useful only as a recovery anchor, not as a reference for reading the code.
