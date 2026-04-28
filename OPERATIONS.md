@@ -175,7 +175,7 @@ for frame-accurate overlay sync. Firefox falls back to `requestAnimationFrame`
 | `8189/udp` | WebRTC media (mediamtx) | systemd `mediamtx.service` | ICE-advertised; browser ↔ Jetson direct |
 | `9090` | Swift detector HTTP | containerd task `detector-swift` | `/metrics`, `/detections` (WebSocket), `/healthz`, `/api/vlm_*` |
 | `9091` | tegrastats exporter | systemd `tegrastats-exporter.service` | Prometheus CPU/GPU/temp gauges |
-| `9092` | Python detector HTTP (if deployed) | containerd task `deepstream-vision` | `/metrics`; currently unstable — see `docs/HANDOFF.md` §9 |
+| `9092` | Python detector HTTP (if deployed) | containerd task `deepstream-vision` | `/metrics`; currently unstable (FPS=0 under sustained load) |
 | `9997` | mediamtx HTTP API | systemd `mediamtx.service` | `/v3/paths/list` etc. |
 
 ## Device-access reference
@@ -258,9 +258,10 @@ WENDY_AGENT=10.42.0.2 wendy run -y --detach   # omit --restart-unless-stopped on
 ssh root@10.42.0.2 'CONTAINER=detector-swift /usr/local/bin/detector-cap'
 ```
 
-See `docs/HANDOFF.md` §3 for the authoritative copy and §10 for the list
-of deploy gotchas (BuildKit cache, disk pressure, `--restart-unless-stopped`
-footgun).
+Common deploy gotchas: BuildKit cache pressure on the dev host, disk
+pressure on the device, and the `--restart-unless-stopped` footgun
+(rapid-crash builds will tight-loop and wedge driver state — never apply
+this flag to a build whose stability you haven't confirmed).
 
 ## Quick-check recipes
 
@@ -324,8 +325,7 @@ ssh root@10.42.0.2 'ps aux --sort=-rss | head -6'
 - **Video panel shows nothing in the browser.** Either the detector
   died (check metrics via proxy), the camera WiFi dropped (`nmcli con
   up "badgers den"` on the Jetson), or mediamtx isn't publishing
-  (`systemctl is-active mediamtx` + `curl .../v3/paths/list`). See
-  `docs/HANDOFF.md` §9.5 for the full FPS=0 decision tree.
+  (`systemctl is-active mediamtx` + `curl .../v3/paths/list`).
 - **VLM descriptions look great but detector crashes faster.** The VLM
   sidecar consumes ~2 GB unified memory; reduces detector headroom. Kill
   it with the `docker stop llama-vlm` recipe above.

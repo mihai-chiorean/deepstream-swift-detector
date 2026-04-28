@@ -10,6 +10,11 @@ net-scale-factor=0.0039215697906911373
 
 # Engine was built outside DeepStream. nvinfer will load the pre-built plan as-is.
 model-engine-file=/app/yolo26n_b2_fp16.engine
+# Fallback: if the .engine isn't present (e.g. fresh clone), nvinfer will build
+# it from the ONNX on first start. First-start is slower (engine-build can take
+# 1-3 min on Orin Nano); subsequent starts use the cached plan. See
+# detector-swift/README.md "Build" section for the trtexec pre-build command.
+onnx-file=/app/yolo26n.onnx
 labelfile-path=/app/labels.txt
 
 # Match the engine build.

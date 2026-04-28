@@ -2,7 +2,7 @@
 
 A Swift port of an NVIDIA DeepStream object-detection pipeline, running on a Jetson Orin Nano 8 GB. Swift orchestrates a GStreamer graph — `rtspsrc → nvv4l2decoder → nvstreammux → nvinfer → nvtracker → fakesink` — reads inference metadata off a pad probe, and serves it as a typed `AsyncStream<DetectionFrame>` into an HTTP + WebSocket surface. Pixels stay on the GPU; Swift never touches an NVMM surface.
 
-> **Blog post with the full story:** [*Swift doing NVIDIA's job, twice*](https://mihaichiorean.com/blog/swift-doing-nvidias-job/) — the two architectural mistakes that shaped this pipeline, with measurements and the deletion-over-refactor pattern.
+> **Blog post with the full story:** [*The hard part of Swift on Jetson was not Swift*](https://mihaichiorean.com/blog/hard-part-of-swift-on-jetson/) — what the language layer needed from the platform underneath it (CDI spec, Swift SDK sysroot), with measurements vs the Python sibling.
 >
 > **Python sibling + upstream context:** the Python version of this detector, plus broader WendyOS sample projects, live in [`wendylabsinc/samples`](https://github.com/wendylabsinc/samples) under `samples/deepstream-vision/`. This repo is a standalone extract focused on the Swift port, with full commit history preserved via `git subtree split`.
 

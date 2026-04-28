@@ -615,6 +615,13 @@ actor GStreamerFrameReader {
     ///
     ///   rtspsrc → rtph264depay → h264parse → nvv4l2decoder
     ///     → nvstreammux → nvinfer → nvtracker → fakesink
+    ///
+    /// `filter-out-class-ids` polarity: drops the listed COCO classes; remaining
+    /// classes pass through. The verbatim list below suppresses 68 classes
+    /// (4;6;8;9;10;11;12;13 + 20..79). Kept: 12 classes — 0=person, 1=bicycle,
+    /// 2=car, 3=motorcycle, 5=airplane, 7=truck, 14=bird, 15=cat, 16=dog,
+    /// 17=horse, 18=sheep, 19=cow. Note: 9/10/11 (traffic light, fire hydrant,
+    /// stop sign) are FILTERED OUT.
     private func buildPipelineString() -> String {
         let url = stream.url
         return """

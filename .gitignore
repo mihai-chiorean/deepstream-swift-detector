@@ -16,3 +16,7 @@ docs/blog-angle-proposal.md
 docs/reliability-audit.md
 docs/billboard-scanner-design.md
 detector-swift/PORT_PLAN.md
+
+# Swift build artifacts
+.build/
+detector-swift/.build/

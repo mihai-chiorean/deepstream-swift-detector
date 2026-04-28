@@ -3,7 +3,7 @@
     "version": "1.0.0",
     "language": "swift",
     "swift": {
-        "baseImage": "192.168.68.70:5000/swift-detector-base:latest",
+        "baseImage": "EDIT THIS — see detector-swift/README.md for what to point at",
         "resources": [
             "streams.json:/app/streams.json",
             "labels.txt:/app/labels.txt",
